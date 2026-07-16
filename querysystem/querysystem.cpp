@@ -43,7 +43,7 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 // KiPreprocessFlushTb: skips per-processor scan, goes directly to HvlFlushRangeListTb.
 #define HV_USE_HYPERCALL_FOR_LOCAL_FLUSH            (1ULL << 1)
 
-// KiPreprocessFlushTb: master gate — enables the TLB flush hypercall path at all
+// KiPreprocessFlushTb: master gate -- enables the TLB flush hypercall path at all
 // (replaces inter-processor TLB shootdown IPIs).
 #define HV_USE_HYPERCALL_FOR_REMOTE_FLUSH           (1ULL << 2)
 
@@ -59,7 +59,7 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 #define HV_USE_RELAXED_TIMING                       (1ULL << 5)
 
 // HvlGetEnlightenmentInfo: installs HvlNotifyLongSpinWait function pointer.
-// Source: HVI bit 6 (indirectly — set into slot+20h).
+// Source: HVI bit 6 (indirectly -- set into slot+20h).
 #define HV_USE_HYPERCALL_FOR_NOTIFY_LONG_SPIN_WAIT  (1ULL << 6)
 
 // Unknown capability bit. Set from HVI features DWORD-3 bit 4.
@@ -171,14 +171,14 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 // Bit 31: PERMANENTLY ZERO (masked by 0x7CFFFFF7). Never set.
 
 //
-// CPUID 0x40000004 EAX — Enlightenment Recommendations (raw HVI word).
+// CPUID 0x40000004 EAX -- Enlightenment Recommendations (raw HVI word).
 // Bit 12 is the nested-virtualisation flag. Not exposed through HvlEnlightenments
 // (it is outside the 0x7CFFFFF7 mask path), so CPUID is the only way to read it.
 //
 #define HVI_ENLIGHTENMENT_NESTED            (1 << 12)
 
 //
-// NtQuerySystemInformation class 0x67 — code-integrity options.
+// NtQuerySystemInformation class 0x67 -- code-integrity options.
 // The IUM bit is the definitive indicator that securekernel.exe is running in VTL1.
 //
 #define SYSTEM_CODE_INTEGRITY_INFORMATION_CLASS  0x67
@@ -193,7 +193,7 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 // Do not redefine it here.
 
 //
-// NtQuerySystemInformation class 0xA9 (169) — VSM protection info.
+// NtQuerySystemInformation class 0xA9 (169) -- VSM protection info.
 // Verified against HvlQueryVsmProtectionInfo at ntoskrnl 0x140A781C8:
 //
 //   +0x00  BYTE  DmaProtectionAvailable    = HvlpProcessIommu() result
@@ -209,7 +209,7 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 //   Minimum buffer: 3 bytes. Maximum meaningful: 4 bytes.
 //
 //
-// TPM device info via Tbsi_GetDeviceInfo (tbs.dll) — loaded dynamically.
+// TPM device info via Tbsi_GetDeviceInfo (tbs.dll) -- loaded dynamically.
 // NtQuerySystemInformation(0xA2) (SeQueryTrustedPlatformModuleInformation) would
 // be the kernel path but it checks KTHREAD.PreviousMode at offset 0x232 and
 // returns STATUS_ACCESS_DENIED unconditionally for user-mode callers.
@@ -225,7 +225,7 @@ typedef struct _TPM_DEVICE_INFO
 typedef UINT32(WINAPI* PFN_Tbsi_GetDeviceInfo)(UINT32 Size, PVOID Info);
 
 //
-// NtQuerySystemInformation class 0xC4 (196) — KVA Shadow / KPTI (Meltdown mitigation).
+// NtQuerySystemInformation class 0xC4 (196) -- KVA Shadow / KPTI (Meltdown mitigation).
 // Verified against KeQueryKvaShadowInformation. Minimum: 4 bytes, ReturnLength = 4.
 // Single DWORD built from KiKvaShadow, KiFlushPcid, KeQueryImplementedPhysicalBits, KeFeatureBits2.
 //
@@ -242,11 +242,11 @@ typedef UINT32(WINAPI* PFN_Tbsi_GetDeviceInfo)(UINT32 Size, PVOID Info);
 #define SYSTEM_KVA_SHADOW_INFORMATION_CLASS  0xC4
 
 //
-// NtQuerySystemInformation class 0xC9 (201) — Speculation Control (Spectre/SSBD/L1TF/MDS).
+// NtQuerySystemInformation class 0xC9 (201) -- Speculation Control (Spectre/SSBD/L1TF/MDS).
 // Verified against KeQuerySpeculationControlInformation. Minimum: 4 bytes, ReturnLength = 8.
 // Two DWORDs (8 bytes total); if caller passes only 4, second DWORD is omitted.
 //
-// DWORD 0 — SpeculationControlFlags (Spectre/Retpoline/IBRS/SSBD/TSX):
+// DWORD 0 -- SpeculationControlFlags (Spectre/Retpoline/IBRS/SSBD/TSX):
 //   bit  0: BranchPredictorsNeedsFlushing = KiSpecFeatures[36]
 //   bit  1: IBRSSupportPresent            = KiSpecFeatures[34]
 //   bit  2: IBPBSupportPresent            = KiSpecFeatures[35]
@@ -273,7 +273,7 @@ typedef UINT32(WINAPI* PFN_Tbsi_GetDeviceInfo)(UINT32 Size, PVOID Info);
 //   bit 29: always 1
 //   bit 30: TsxAbsentAtBoot (TSX not present when system booted)
 //
-// DWORD 1 — SpeculationControlFlags2 (L1TF / MDS / TAA / SRBDS):
+// DWORD 1 -- SpeculationControlFlags2 (L1TF / MDS / TAA / SRBDS):
 //   [2:0]:  L1TFMitigationState    = KeFeatureBits2[21:19] (0=not needed, 1=OS, 2=HW)
 //   bit  3: FBClearPresent         = KiKvaShadow && SpcIsFbClearSupported()
 //   bit  4: always 1
@@ -294,24 +294,24 @@ typedef struct _SYSTEM_SPECULATION_CONTROL_INFORMATION
 } SYSTEM_SPECULATION_CONTROL_INFORMATION;
 
 //
-// NtQuerySystemInformation class 0xD5 (213) — Secure Speculation Control (VSM/VTL2 side).
+// NtQuerySystemInformation class 0xD5 (213) -- Secure Speculation Control (VSM/VTL2 side).
 // Verified against KeQuerySecureSpeculationInformation. Minimum: 4 bytes, ReturnLength = 8.
 // Single DWORD. Content is VslGetSecureSpeculationControlInformation() bits 0-19 remapped
-// to output bits 0-15 (non-linearly — see comments in KeQuerySecureSpeculationInformation).
+// to output bits 0-15 (non-linearly -- see comments in KeQuerySecureSpeculationInformation).
 //
 #define SYSTEM_SECURE_SPECULATION_CONTROL_CLASS  0xD5
 
 //
-// NtQuerySystemInformation class 0x9F (159) — Hypervisor Detail Information.
+// NtQuerySystemInformation class 0x9F (159) -- Hypervisor Detail Information.
 // Verified against HvlQueryDetailInfo. Requires EXACTLY 0x70 (112) bytes.
 // Seven consecutive 16-byte CPUID leaf dumps in order:
-//   [0x00] CPUID 0x40000000 — max leaf + vendor string
-//   [0x10] CPUID 0x40000001 — interface signature
-//   [0x20] CPUID 0x40000002 — hypervisor version
-//   [0x30] CPUID 0x40000003 — partition privileges / feature identification
-//   [0x40] CPUID 0x40000006 — hardware features
-//   [0x50] CPUID 0x40000004 — enlightenment recommendations
-//   [0x60] CPUID 0x40000005 — implementation limits
+//   [0x00] CPUID 0x40000000 -- max leaf + vendor string
+//   [0x10] CPUID 0x40000001 -- interface signature
+//   [0x20] CPUID 0x40000002 -- hypervisor version
+//   [0x30] CPUID 0x40000003 -- partition privileges / feature identification
+//   [0x40] CPUID 0x40000006 -- hardware features
+//   [0x50] CPUID 0x40000004 -- enlightenment recommendations
+//   [0x60] CPUID 0x40000005 -- implementation limits
 //
 #define SYSTEM_HYPERVISOR_DETAIL_INFORMATION_CLASS  0x9F
 
@@ -332,7 +332,7 @@ typedef struct _SYSTEM_HYPERVISOR_DETAIL_INFORMATION
 } SYSTEM_HYPERVISOR_DETAIL_INFORMATION;
 
 //
-// NtQuerySystemInformation class 0xA6 (166) — HSTI (Hardware Security Test Interface).
+// NtQuerySystemInformation class 0xA6 (166) -- HSTI (Hardware Security Test Interface).
 // Blob registered at boot by UEFI firmware. Returns STATUS_NOT_FOUND if absent.
 // Required size is dynamic; caller first queries with 0 bytes to get ReturnLength,
 // then re-queries with that size. Blob follows UEFI ADAPTER_INFORMATION_REGISTER spec.
@@ -341,24 +341,24 @@ typedef struct _SYSTEM_HYPERVISOR_DETAIL_INFORMATION
 
 typedef struct _HSTI_BLOB_HEADER
 {
-	ULONG  PortType;                       // +0x00 — 0 = hardware security test
-	ULONG  DataRegionSize;                 // +0x04 — total blob size in bytes
-	USHORT Role;                           // +0x08 — 1 = platform manufacturer
+	ULONG  PortType;                       // +0x00 -- 0 = hardware security test
+	ULONG  DataRegionSize;                 // +0x04 -- total blob size in bytes
+	USHORT Role;                           // +0x08 -- 1 = platform manufacturer
 	USHORT ImplementationID;               // +0x0A
-	WCHAR  ImplementorName[8];             // +0x0C — 16 bytes (8 UTF-16 chars)
-	ULONG  SecurityFeaturesRequired;       // +0x1C — features firmware claims it must test
-	ULONG  SecurityFeaturesImplemented;    // +0x20 — features it actually tested
-	ULONG  SecurityFeaturesVerified;       // +0x24 — features that passed
+	WCHAR  ImplementorName[8];             // +0x0C -- 16 bytes (8 UTF-16 chars)
+	ULONG  SecurityFeaturesRequired;       // +0x1C -- features firmware claims it must test
+	ULONG  SecurityFeaturesImplemented;    // +0x20 -- features it actually tested
+	ULONG  SecurityFeaturesVerified;       // +0x24 -- features that passed
 	// variable: SecurityFeaturesResultBuffer follows at +0x28
 } HSTI_BLOB_HEADER;
 
 //
-// NtQuerySystemInformation class 0xA5 (165) — Device Guard / VBS flags.
+// NtQuerySystemInformation class 0xA5 (165) -- Device Guard / VBS flags.
 // Verified against ExpQuerySystemInformation case 165 at ntoskrnl 0x140ACF920.
 //
 // Minimum buffer: 0x10 bytes. Kernel copies 16 bytes via movaps xmm0.
 //
-// Byte +0 — built from VslIsSecureKernelRunning + VslGetNestedPageProtectionFlags (NPF):
+// Byte +0 -- built from VslIsSecureKernelRunning + VslGetNestedPageProtectionFlags (NPF):
 //   bit 0: SecureKernelRunning     = VslIsSecureKernelRunning()
 //   bit 1: HvciKernelEnforcement   = NPF bit 1  (HVCI strict kernel-mode CI)
 //   bit 2: HvciUserModeEnabled     = NPF bit 5  (user-mode CI / NX via VSM)
@@ -366,7 +366,7 @@ typedef struct _HSTI_BLOB_HEADER
 //   bit 4: FirmwarePageProtection  = ExpFirmwarePageProtectionSupported & 1
 //   bit 5: IumEnabled              = VslpEnterIumSecureMode() succeeded (IUM active)
 //
-// Byte +1 — VslIsTrustletRunning + further NPF bits:
+// Byte +1 -- VslIsTrustletRunning + further NPF bits:
 //   bit 0: TrustletRunning         = VslIsTrustletRunning()
 //   bit 1: KmciSupplemental        = NPF bit 9
 //   bit 2: KernelShadowStacks      = NPF bit 11 (CET-SS for kernel via VSM)
@@ -391,7 +391,7 @@ typedef struct _SYSTEM_DEVICE_GUARD_INFORMATION
 } SYSTEM_DEVICE_GUARD_INFORMATION;
 
 //
-// NtQuerySystemInformation class 0xDD (221) — CET / Shadow Stack status.
+// NtQuerySystemInformation class 0xDD (221) -- CET / Shadow Stack status.
 // Verified against ExpQuerySystemInformation case 221 at ntoskrnl 0x140ACF920.
 //
 // Minimum buffer: 4 bytes. Returns one ULONG built from four KeIs* helpers:
@@ -575,7 +575,7 @@ union _NK_FLAGS
 void PrintTpmAndCredentialGuardInfo()
 {
 	//
-	// TPM — Tbsi_GetDeviceInfo (tbs.dll).
+	// TPM -- Tbsi_GetDeviceInfo (tbs.dll).
 	// Returns version, interface type, and implementation revision.
 	// Works from user mode without elevation.
 	//
@@ -626,9 +626,9 @@ void PrintTpmAndCredentialGuardInfo()
 	// Credential Guard.
 	//
 	// Two independent indicators:
-	//   1. DeviceGuard scenario registry key — "Enabled" and "Running" values
+	//   1. DeviceGuard scenario registry key -- "Enabled" and "Running" values
 	//      written by the OS (Running=1 confirmed at boot if CG is active).
-	//   2. LSA config flags — what is *configured* in policy regardless of
+	//   2. LSA config flags -- what is *configured* in policy regardless of
 	//      whether the VM actually started.
 	//
 	printf("\nCredential Guard:\n");
@@ -637,7 +637,7 @@ void PrintTpmAndCredentialGuardInfo()
 	HKEY  hKey;
 	DWORD value, size;
 
-	// DeviceGuard scenario key — most reliable running-state indicator
+	// DeviceGuard scenario key -- most reliable running-state indicator
 	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
 		L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\CredentialGuard",
 		0, KEY_READ, &hKey) == ERROR_SUCCESS)
@@ -660,7 +660,7 @@ void PrintTpmAndCredentialGuardInfo()
 			"Scenarios\\CredentialGuard");
 	}
 
-	// LsaCfgFlags — LSA policy configuration
+	// LsaCfgFlags -- LSA policy configuration
 	// 0 = disabled, 1 = enabled with UEFI lock, 2 = enabled without UEFI lock
 	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
 		L"SYSTEM\\CurrentControlSet\\Control\\Lsa",
@@ -759,7 +759,7 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 	ULONG returnLength = 0;
 
 	//
-	// 0xC4 — KVA Shadow / KPTI (Meltdown mitigation)
+	// 0xC4 -- KVA Shadow / KPTI (Meltdown mitigation)
 	//
 	printf("\nKVA Shadow / KPTI (0xC4 KeQueryKvaShadowInformation):\n");
 	printf("------------------------------------------------------------\n");
@@ -788,7 +788,7 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 	}
 
 	//
-	// 0xC9 — Speculation Control (Spectre / SSBD / L1TF / MDS / TSX)
+	// 0xC9 -- Speculation Control (Spectre / SSBD / L1TF / MDS / TSX)
 	//
 	printf("\nSpeculation Control (0xC9 KeQuerySpeculationControlInformation):\n");
 	printf("------------------------------------------------------------\n");
@@ -807,7 +807,7 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 		ULONG f0 = spec.SpeculationControlFlags;
 		ULONG f1 = spec.SpeculationControlFlags2;
 
-		printf(" DWORD 0 — Spectre/Retpoline/IBRS/SSBD/TSX:\n");
+		printf(" DWORD 0 -- Spectre/Retpoline/IBRS/SSBD/TSX:\n");
 		PrintBit("BranchPredictorsNeedsFlushing [0]", f0, 0);
 		PrintBit("IBRSSupportPresent            [1]", f0, 1);
 		PrintBit("IBPBSupportPresent            [2]", f0, 2);
@@ -830,7 +830,7 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 		PrintBit("TsxAbsentAtBoot               [30]", f0, 30);
 		printf("  Raw DWORD 0: 0x%08X\n", f0);
 
-		printf(" DWORD 1 — L1TF / MDS / TAA / SRBDS:\n");
+		printf(" DWORD 1 -- L1TF / MDS / TAA / SRBDS:\n");
 		printf("  %-52s : %u\n", "L1TFMitigationState [2:0] (0=OK,1=OS,2=HW)", f1 & 7);
 		PrintBit("FBClearPresent           [3]  (MDS/TAA fill-buf clear)", f1, 3);
 		PrintTwoBit("TAA state             [9:8]  (0=N/A,2=mitigated,3=unmitigated)",
@@ -841,7 +841,7 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 	}
 
 	//
-	// 0xD5 — Secure Speculation (VSM/VTL2 side mitigation state)
+	// 0xD5 -- Secure Speculation (VSM/VTL2 side mitigation state)
 	//
 	printf("\nSecure Speculation Control (0xD5 KeQuerySecureSpeculationInformation):\n");
 	printf("------------------------------------------------------------\n");
@@ -896,7 +896,7 @@ void PrintHvDetailInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 		return;
 	}
 
-	// CPUID 0x40000000 — vendor + max leaf
+	// CPUID 0x40000000 -- vendor + max leaf
 	char vendor[13] = { 0 };
 	memcpy(vendor + 0, &hd.Leaf40000000.Ebx, 4);
 	memcpy(vendor + 4, &hd.Leaf40000000.Ecx, 4);
@@ -904,12 +904,12 @@ void PrintHvDetailInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 	printf("  Vendor string       : %.12s\n", vendor);
 	printf("  Max hypervisor leaf : 0x%08X\n", hd.Leaf40000000.Eax);
 
-	// CPUID 0x40000001 — interface signature ("Hv#1")
+	// CPUID 0x40000001 -- interface signature ("Hv#1")
 	char ifc[5] = { 0 };
 	memcpy(ifc, &hd.Leaf40000001.Eax, 4);
 	printf("  Interface signature : %.4s\n", ifc);
 
-	// CPUID 0x40000002 — version
+	// CPUID 0x40000002 -- version
 	ULONG ver = hd.Leaf40000002.Eax;
 	printf("  Version             : %u.%u.%u (build %u, SP %u)\n",
 		(ver >> 0) & 0xFF,   // major
@@ -919,9 +919,9 @@ void PrintHvDetailInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 		hd.Leaf40000002.Edx  // service number
 	);
 
-	// CPUID 0x40000003 — partition privilege flags (EAX)
+	// CPUID 0x40000003 -- partition privilege flags (EAX)
 	ULONG pp = hd.Leaf40000003.Eax;
-	printf("\n CPUID 0x40000003 EAX — Partition Privilege Flags: 0x%08X\n", pp);
+	printf("\n CPUID 0x40000003 EAX -- Partition Privilege Flags: 0x%08X\n", pp);
 	PrintBit("CreatePartitions             [0]", pp, 0);
 	PrintBit("AccessPartitionId            [1]", pp, 1);
 	PrintBit("AccessMemoryPool             [2]", pp, 2);
@@ -943,9 +943,9 @@ void PrintHvDetailInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 	printf("  EBX=0x%08X  ECX=0x%08X  EDX=0x%08X\n",
 		hd.Leaf40000003.Ebx, hd.Leaf40000003.Ecx, hd.Leaf40000003.Edx);
 
-	// CPUID 0x40000004 — enlightenment recommendations (EAX)
+	// CPUID 0x40000004 -- enlightenment recommendations (EAX)
 	ULONG er = hd.Leaf40000004.Eax;
-	printf("\n CPUID 0x40000004 EAX — Enlightenment Recommendations: 0x%08X\n", er);
+	printf("\n CPUID 0x40000004 EAX -- Enlightenment Recommendations: 0x%08X\n", er);
 	printf("  (This is the raw HVI word that HvlEnlightenments is derived from)\n");
 	PrintBit("UseHypercallForAddressSpaceSwitch [0]", er, 0);
 	PrintBit("UseHypercallForLocalFlush         [1]", er, 1);
@@ -971,15 +971,15 @@ void PrintHvDetailInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 	printf("  EBX (spinlock retries)=0x%08X  ECX=0x%08X  EDX=0x%08X\n",
 		hd.Leaf40000004.Ebx, hd.Leaf40000004.Ecx, hd.Leaf40000004.Edx);
 
-	// CPUID 0x40000005 — implementation limits
-	printf("\n CPUID 0x40000005 — Implementation Limits:\n");
+	// CPUID 0x40000005 -- implementation limits
+	printf("\n CPUID 0x40000005 -- Implementation Limits:\n");
 	printf("  MaxVirtualProcessors  (EAX): %u\n", hd.Leaf40000005.Eax);
 	printf("  MaxLogicalProcessors  (EBX): %u\n", hd.Leaf40000005.Ebx);
 	printf("  MaxInterruptMappings  (ECX): %u\n", hd.Leaf40000005.Ecx);
 
-	// CPUID 0x40000006 — hardware features (EAX)
+	// CPUID 0x40000006 -- hardware features (EAX)
 	ULONG hw = hd.Leaf40000006.Eax;
-	printf("\n CPUID 0x40000006 EAX — Hardware Features: 0x%08X\n", hw);
+	printf("\n CPUID 0x40000006 EAX -- Hardware Features: 0x%08X\n", hw);
 	PrintBit("ApicOverlayAssist                [0]", hw, 0);
 	PrintBit("MsrBitmaps                       [1]", hw, 1);
 	PrintBit("ArchitecturalPerfCounters        [2]", hw, 2);
@@ -1006,7 +1006,7 @@ void PrintHvDetailInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 
 void PrintHstiInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 {
-	printf("\nHSTI — Hardware Security Test Interface (0xA6 SeQueryHSTIResults):\n");
+	printf("\nHSTI -- Hardware Security Test Interface (0xA6 SeQueryHSTIResults):\n");
 	printf("------------------------------------------------------------\n");
 
 	// Step 1: probe required size (expect STATUS_INFO_LENGTH_MISMATCH + ReturnLength set)
@@ -1081,7 +1081,7 @@ void PrintDeviceGuardInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 	ULONG returnLength = 0;
 
 	//
-	// SystemDeviceGuardInformation (0xA5) — core VBS protection state.
+	// SystemDeviceGuardInformation (0xA5) -- core VBS protection state.
 	//
 	printf("\nDevice Guard / VBS protection flags (0xA5):\n");
 	printf("------------------------------------------------------------\n");
@@ -1136,7 +1136,7 @@ void PrintDeviceGuardInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 	}
 
 	//
-	// UEFI Secure Boot — registry (set by bootloader; readable without elevation).
+	// UEFI Secure Boot -- registry (set by bootloader; readable without elevation).
 	//
 	printf("\nSecure Boot:\n");
 	printf("------------------------------------------------------------\n");
@@ -1157,7 +1157,7 @@ void PrintDeviceGuardInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 	}
 
 	//
-	// SystemControlFlowTransitionInformation (0xDD) — CET / Shadow Stack.
+	// SystemControlFlowTransitionInformation (0xDD) -- CET / Shadow Stack.
 	// bit 0 = KeIsCetCapable, bit 1 = KeIsUserCetAllowed,
 	// bit 8 = KeIsKernelCetEnabled, bit 9 = KeIsKernelCetAuditModeEnabled
 	//
@@ -1194,7 +1194,7 @@ void PrintVsmAndNestingInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformatio
 	//
 	// Nesting: CPUID 0x40000004 EAX bit 12.
 	// The outer hypervisor sets this to advertise nested-virt support.
-	// Not available via NtQuerySystemInformation(0x5B) — must use CPUID.
+	// Not available via NtQuerySystemInformation(0x5B) -- must use CPUID.
 	//
 	int cpuInfo[4] = { 0 };
 	__cpuid(cpuInfo, 0x40000004);
