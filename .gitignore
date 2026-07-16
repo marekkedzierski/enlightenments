@@ -1,0 +1,47 @@
+# Visual Studio build output
+[Dd]ebug/
+[Rr]elease/
+x64/
+x86/
+[Ww][Ii][Nn]32/
+bld/
+[Bb]in/
+[Oo]bj/
+[Ll]og/
+[Ll]ogs/
+
+# Visual Studio cache / options
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+*.vcxproj.user
+
+# Build artifacts
+*.obj
+*.pch
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.idb
+*.ipdb
+*.iobj
+*.ipobj
+*.pgc
+*.pgd
+*.rsp
+*.tlog
+*.lastbuildstate
+*.sbr
+*.bsc
+*.log
+
+# Test results / coverage
+TestResults/
+*.trx
+*.coverage
+*.coveragexml
