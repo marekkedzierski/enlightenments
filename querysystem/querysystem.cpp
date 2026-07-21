@@ -1254,8 +1254,154 @@ void PrintVsmAndNestingInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformatio
 		vsm.ApicVirtAvailable ? "YES" : "NO");
 }
 
+// -----------------------------------------------------------------------------
+// PrintSystemInfo -- basic system information dump
+//
+// Sources:
+//   OS version  : RtlGetVersion (ntdll) -- ignores application manifest,
+//                 always returns the real build number.
+//   Full build  : HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\UBR
+//                 gives the update revision (e.g. 26100.4061 where 4061 = UBR).
+//   CPU brand   : CPUID leaves 0x80000002-0x80000004 (Intel/AMD brand string).
+//   Firmware    : GetFirmwareType -- BIOS vs UEFI.
+//   RAM         : GlobalMemoryStatusEx.
+//   Uptime      : GetTickCount64.
+//   Edition     : HKLM\...\CurrentVersion\ProductName + DisplayVersion.
+// -----------------------------------------------------------------------------
+
+typedef NTSTATUS (WINAPI* PFN_RtlGetVersion)(PRTL_OSVERSIONINFOW);
+
+static void RegQueryDword(HKEY hKey, const wchar_t* value, DWORD* out)
+{
+	DWORD size = sizeof(DWORD);
+	RegQueryValueExW(hKey, value, nullptr, nullptr, (LPBYTE)out, &size);
+}
+
+static void RegQueryStr(HKEY hKey, const wchar_t* value, char* buf, DWORD bufBytes)
+{
+	wchar_t tmp[256] = {};
+	DWORD size = sizeof(tmp);
+	if (RegQueryValueExW(hKey, value, nullptr, nullptr, (LPBYTE)tmp, &size) == ERROR_SUCCESS)
+		WideCharToMultiByte(CP_UTF8, 0, tmp, -1, buf, (int)bufBytes, nullptr, nullptr);
+}
+
+void PrintSystemInfo()
+{
+	printf("System Information\n");
+	printf("============================================================\n");
+
+	// -- OS version via RtlGetVersion -----------------------------------------
+	RTL_OSVERSIONINFOW osvi = { sizeof(osvi) };
+	auto pRtlGetVersion = (PFN_RtlGetVersion)
+		GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "RtlGetVersion");
+	if (pRtlGetVersion)
+		pRtlGetVersion(&osvi);
+
+	// -- Registry: CurrentVersion ----------------------------------------------
+	HKEY hCv = nullptr;
+	char productName[128]  = "Unknown";
+	char displayVersion[32] = {};   // e.g. "24H2"
+	char currentBuild[16]  = {};
+	DWORD ubr = 0;
+
+	if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+			L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+			0, KEY_READ, &hCv) == ERROR_SUCCESS)
+	{
+		RegQueryStr  (hCv, L"ProductName",    productName,    sizeof(productName));
+		RegQueryStr  (hCv, L"DisplayVersion", displayVersion, sizeof(displayVersion));
+		RegQueryStr  (hCv, L"CurrentBuild",   currentBuild,   sizeof(currentBuild));
+		RegQueryDword(hCv, L"UBR",            &ubr);
+		RegCloseKey(hCv);
+	}
+
+	// Determine Windows generation from build number
+	const char* winGen = osvi.dwBuildNumber >= 22000 ? "Windows 11" :
+	                     osvi.dwBuildNumber >= 10240 ? "Windows 10" :
+	                                                   "Windows (older)";
+
+	printf("%-30s : %s %s (%s)\n", "OS",
+	       winGen, displayVersion[0] ? displayVersion : "", productName);
+	printf("%-30s : %lu.%lu.%lu.%lu\n", "Version (major.minor.build.UBR)",
+	       osvi.dwMajorVersion, osvi.dwMinorVersion, osvi.dwBuildNumber, ubr);
+
+	// -- Computer name ---------------------------------------------------------
+	wchar_t compName[MAX_COMPUTERNAME_LENGTH + 1] = {};
+	DWORD   compLen = MAX_COMPUTERNAME_LENGTH + 1;
+	GetComputerNameW(compName, &compLen);
+	printf("%-30s : %ls\n", "Computer name", compName);
+
+	// -- Current user ----------------------------------------------------------
+	wchar_t userName[256] = {};
+	DWORD   userLen = 256;
+	GetUserNameW(userName, &userLen);
+	printf("%-30s : %ls\n", "Current user", userName);
+
+	// -- Firmware type ---------------------------------------------------------
+	FIRMWARE_TYPE ft = FirmwareTypeUnknown;
+	GetFirmwareType(&ft);
+	const char* ftStr = ft == FirmwareTypeUefi ? "UEFI" :
+	                    ft == FirmwareTypeBios  ? "Legacy BIOS" : "Unknown";
+	printf("%-30s : %s\n", "Firmware type", ftStr);
+
+	// -- CPU brand string (CPUID 0x80000002-0x80000004) -----------------------
+	char brand[49] = {};
+	int  cpuInfo[4];
+	__cpuid(cpuInfo, 0x80000000);
+	if ((unsigned)cpuInfo[0] >= 0x80000004)
+	{
+		__cpuid(cpuInfo, 0x80000002); memcpy(brand,    cpuInfo, 16);
+		__cpuid(cpuInfo, 0x80000003); memcpy(brand+16, cpuInfo, 16);
+		__cpuid(cpuInfo, 0x80000004); memcpy(brand+32, cpuInfo, 16);
+		const char* trimmed = brand;
+		while (*trimmed == ' ') trimmed++;
+		printf("%-30s : %s\n", "CPU", trimmed);
+	}
+
+	// -- CPU architecture and logical processor count --------------------------
+	SYSTEM_INFO si = {};
+	GetNativeSystemInfo(&si);
+	const char* archStr =
+		si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64 ? "x86-64" :
+		si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_ARM64 ? "ARM64"  :
+		si.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_INTEL ? "x86-32" : "Unknown";
+	printf("%-30s : %s  (%lu logical processors)\n", "CPU architecture",
+	       archStr, si.dwNumberOfProcessors);
+
+	// -- RAM -------------------------------------------------------------------
+	MEMORYSTATUSEX ms = { sizeof(ms) };
+	GlobalMemoryStatusEx(&ms);
+	printf("%-30s : %.1f GB total  (%.1f GB available)\n", "Physical RAM",
+	       (double)ms.ullTotalPhys / (1024.0*1024.0*1024.0),
+	       (double)ms.ullAvailPhys / (1024.0*1024.0*1024.0));
+
+	// -- System uptime ---------------------------------------------------------
+	ULONGLONG ms64 = GetTickCount64();
+	DWORD days     = (DWORD)(ms64 / 86400000ULL);
+	DWORD hours    = (DWORD)((ms64 % 86400000ULL) / 3600000ULL);
+	DWORD minutes  = (DWORD)((ms64 % 3600000ULL)  / 60000ULL);
+	printf("%-30s : %u days  %u hours  %u minutes\n", "Uptime", days, hours, minutes);
+
+	// -- Process privilege -----------------------------------------------------
+	BOOL elevated = FALSE;
+	HANDLE hTok;
+	if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hTok))
+	{
+		TOKEN_ELEVATION elev; DWORD sz;
+		if (GetTokenInformation(hTok, TokenElevation, &elev, sizeof(elev), &sz))
+			elevated = elev.TokenIsElevated;
+		CloseHandle(hTok);
+	}
+	printf("%-30s : %s\n", "Process privilege",
+	       elevated ? "Elevated (Administrator)" : "Standard user");
+
+	printf("============================================================\n\n");
+}
+
 int main()
 {
+	PrintSystemInfo();
+
 	HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
 	if (!hNtdll) return -1;
 
