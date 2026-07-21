@@ -940,8 +940,18 @@ void PrintHvDetailInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 	PrintBit("EnableExtendedHypercalls     [15]", pp, 15);
 	PrintBit("StartVirtualProcessor        [16]", pp, 16);
 	PrintBit("IsolateSecureVmReservations  [17]", pp, 17);
-	printf("  EBX=0x%08X  ECX=0x%08X  EDX=0x%08X\n",
-		hd.Leaf40000003.Ebx, hd.Leaf40000003.Ecx, hd.Leaf40000003.Edx);
+	printf("  EBX=0x%08X  ECX=0x%08X\n",
+		hd.Leaf40000003.Ebx, hd.Leaf40000003.Ecx);
+
+	// CPUID 0x40000003 EDX -- HAL IOMMU domain capability flags.
+	// Extracted by HalpIommuInitDiscard during HAL phase-1 initialisation:
+	//   bit 24: HalpHvIommuDeviceDomain    -- HV provides device-level DMA isolation
+	//   bit 25: HalpHvParaVirtIommuDomain  -- HV provides paravirt IOMMU domain
+	ULONG edx3 = hd.Leaf40000003.Edx;
+	printf("\n CPUID 0x40000003 EDX -- HAL IOMMU domain flags: 0x%08X\n", edx3);
+	PrintBit("HalpHvIommuDeviceDomain    [24] HV device-level DMA isolation", edx3, 24);
+	PrintBit("HalpHvParaVirtIommuDomain  [25] HV paravirt IOMMU domain",      edx3, 25);
+	printf("  (remaining EDX bits undocumented / reserved)\n");
 
 	// CPUID 0x40000004 -- enlightenment recommendations (EAX)
 	ULONG er = hd.Leaf40000004.Eax;
@@ -1398,6 +1408,224 @@ void PrintSystemInfo()
 	printf("============================================================\n\n");
 }
 
+// -----------------------------------------------------------------------------
+// ProbeAcpiTable -- check whether a given ACPI table exists.
+//
+// Mimics HvlpProcessIommu: passes a 20-byte SYSTEM_FIRMWARE_TABLE_INFORMATION
+// with BufferLength=0 (probe-only). If the table exists the kernel returns
+// STATUS_BUFFER_TOO_SMALL (0xC0000023) and writes the required size into
+// *ReturnLength; if the table is absent it returns STATUS_NOT_FOUND or similar.
+//
+// TableID convention: the 4-char ACPI signature stored as a little-endian DWORD,
+// i.e. the first ASCII character is the least-significant byte.
+//   'SDEV' bytes S,D,E,V -> LE DWORD 0x56454453
+//   'IVRS' bytes I,V,R,S -> LE DWORD 0x53525649
+//   'DMAR' bytes D,M,A,R -> LE DWORD 0x52414D44
+//   'MCFG' bytes M,C,F,G -> LE DWORD 0x4746434D
+// -----------------------------------------------------------------------------
+
+static BOOL ProbeAcpiTable(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation,
+                            DWORD tableId)
+{
+#pragma pack(push, 1)
+	struct
+	{
+		ULONG ProviderSignature;  // 'ACPI' = 0x41435049
+		ULONG Action;             // 1 = Get
+		ULONG TableID;
+		ULONG BufferLength;       // 0 = probe for size only
+		ULONG Padding;            // pad to 20 bytes (matches HvlpProcessIommu call)
+	} sfi = { 0x41435049u, 1u, tableId, 0u, 0u };
+#pragma pack(pop)
+
+	ULONG returnLength = 0;
+	NTSTATUS status = NtQuerySystemInformation(
+		(SYSTEM_INFORMATION_CLASS)0x4C,
+		&sfi, sizeof(sfi), &returnLength);
+
+	// Table present: STATUS_BUFFER_TOO_SMALL with ReturnLength > struct size.
+	return (status == (NTSTATUS)0xC0000023u && returnLength > sizeof(sfi));
+}
+
+// -----------------------------------------------------------------------------
+// PrintDmaProtectionDetail -- securekernel-derived DMA protection analysis.
+//
+// Sources verified against securekernel.exe disassembly:
+//   ShvlpHardwareFeatures  = CPUID 0x40000006 EAX (HviGetHardwareFeatures)
+//   SkpnppSdevInitialize   = BugChecks (0xA5/'SDEV') if bit 7 = 0 and SDEV present
+//   SkhalInitSystem        = initialises per-device IOMMU domain model at VTL1 boot
+//   HalpIommuInitDiscard   = reads CPUID 0x40000003 EDX bits 24-25 into
+//                            HalpHvIommuDeviceDomain / HalpHvParaVirtIommuDomain
+//   ShvlAttachDeviceDomain = hypercall 0xB2: assigns device to IOMMU domain
+//   ShvlMapDeviceGpaPages  = hypercall 0xB3: maps specific GPAs into device domain
+//   SkmiProtectPageRange   = sets SLAT/NPT permissions; BugCheck 0x1A/0x90A on failure
+// -----------------------------------------------------------------------------
+
+void PrintDmaProtectionDetail(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
+{
+	printf("\nKernel DMA Protection -- securekernel enforcement detail:\n");
+	printf("------------------------------------------------------------\n");
+
+	//
+	// Determine hypervisor presence and verify max CPUID leaf >= 0x40000006.
+	//
+	int cpuInfo[4] = { 0 };
+	__cpuid(cpuInfo, 1);
+	bool hvPresent = ((cpuInfo[2] >> 31) & 1) != 0;
+	if (hvPresent)
+	{
+		__cpuid(cpuInfo, 0x40000000);
+		hvPresent = ((ULONG)cpuInfo[0] >= 0x40000006u);
+	}
+
+	//
+	// CPUID 0x40000006 EAX bits 5 and 7 -- annotated with securekernel context.
+	//
+	// bit 5: when set, HalpIommuInitDiscard replaces the entire HAL IOMMU
+	//        dispatch table with HV-managed wrappers (IommuHvSetAddressSpace,
+	//        IommuHvFlushTb, IommuHvDevicePowerChange, ...) and sets
+	//        HalpHvIommu = 1.  All IOMMU operations then go via hypercalls
+	//        instead of direct MMIO to AMD-Vi / Intel VT-d hardware.
+	//
+	// bit 7: the single hardware-capability gate in securekernel.exe.
+	//        HviGetHardwareFeatures stores this in ShvlpHardwareFeatures.
+	//        IumGetDmaEnabler returns STATUS_NOT_SUPPORTED if bit 7 = 0.
+	//        SkpnppSdevInitialize calls SkeBugCheckEx(0xA5, 'SDEV', ...)
+	//        if bit 7 = 0 and the ACPI SDEV table is present -- the system
+	//        cannot boot into VBS without an IOMMU when secure devices exist.
+	//        This same bit feeds NtQuerySystemInformation(0xA9) byte[1]
+	//        (DmaProtectionInUse) when the hypervisor and VSM are active.
+	//
+	ULONG hw6 = 0;
+	if (hvPresent)
+	{
+		__cpuid(cpuInfo, 0x40000006);
+		hw6 = (ULONG)cpuInfo[0];
+	}
+
+	printf("CPUID 0x40000006 EAX -- securekernel DMA gate bits:\n");
+	if (hvPresent)
+	{
+		printf("  bit 5  HV-managed IOMMU (HalpHvIommu=1)           : %s\n",
+			(hw6 >> 5) & 1
+			? "YES -- HAL IOMMU dispatch replaced with IommuHv* wrappers"
+			: "NO  -- HAL programs AMD-Vi/VT-d directly");
+		printf("  bit 7  DMA remapping present (SK SDEV gate)        : %s\n",
+			(hw6 >> 7) & 1
+			? "YES -- securekernel IOMMU domain model operational"
+			: "NO  -- IumGetDmaEnabler returns NOT_SUPPORTED; SDEV would BugCheck");
+	}
+	else
+	{
+		printf("  N/A (no hypervisor connected -- CPUID 0x40000006 not meaningful)\n");
+	}
+
+	//
+	// ACPI table presence via NtQuerySystemInformation(0x4C).
+	//
+	// SDEV (Secure Devices):
+	//   securekernel reads this in SkpnppSdevInitialize / SkhalInitSystem
+	//   to discover which devices need per-device IOMMU domain protection.
+	//   SkpnpSdevDeviceTypesAvailable bit 0 = ACPI-namespace type present,
+	//   bit 1 = PCIe type present.  Both drive SkhalpPciInitialize and
+	//   SkhalpAcProcessSdevEntry.  If SDEV present and bit 7 of
+	//   CPUID 0x40000006 is 0, securekernel BugChecks immediately at boot.
+	//
+	// IVRS (AMD) / DMAR (Intel):
+	//   probed by HvlpProcessIommu to determine DmaProtectionAvailable
+	//   (NtQuerySystemInformation 0xA9 byte[0]).  Presence confirms the
+	//   BIOS described an IOMMU in firmware.  Does NOT verify it is enabled
+	//   or translating -- only the hypervisor's bit 7 assertion does that.
+	//
+	// MCFG:
+	//   used by SkhalpPciMcfgInit in securekernel to map PCIe config space
+	//   so the secure kernel can enumerate and attach PCI DMA devices.
+	//
+	struct { DWORD sig; const char* name; const char* note; } tables[] = {
+		{ 0x56454453u, "SDEV",
+		  "Secure Devices -- SK per-device DMA policy (BugCheck if IOMMU absent)" },
+		{ 0x53525649u, "IVRS",
+		  "AMD I/O Virtualization Reporting Structure (AMD-Vi descriptor)" },
+		{ 0x52414D44u, "DMAR",
+		  "Intel DMA Remapping / VT-d descriptor" },
+		{ 0x4746434Du, "MCFG",
+		  "PCIe MMCFG -- SkhalpPciMcfgInit in securekernel" },
+	};
+
+	printf("\nACPI table presence (NtQuerySystemInformation 0x4C):\n");
+	BOOL present[4] = {};
+	for (int i = 0; i < 4; i++)
+	{
+		present[i] = ProbeAcpiTable(NtQuerySystemInformation, tables[i].sig);
+		printf("  %-5s : %-10s %s\n",
+			tables[i].name,
+			present[i] ? "PRESENT" : "absent",
+			present[i] ? tables[i].note : "");
+	}
+
+	//
+	// Read Device Guard state and synthesise the active enforcement model.
+	//
+	// securekernel enforcement is dual-layered:
+	//   1. IOMMU domain isolation  (ShvlAttachDeviceDomain, hypercall 0xB2)
+	//      All devices start in VTL1-owned domains with zero pages mapped.
+	//      DMA is only allowed to pages explicitly granted by the secure
+	//      kernel via ShvlMapDeviceGpaPages (hypercall 0xB3).
+	//      ShvlUnmapDeviceGpaPages (0xB4) revokes access when done.
+	//   2. SLAT / nested page table enforcement  (SkmiProtectPageRange)
+	//      Even if an IOMMU domain mapping were wrong, SLAT prevents DMA
+	//      to pages not marked as device-accessible at the hypervisor level.
+	//      Any failure to set SLAT permissions is fatal:
+	//      SkeBugCheckEx(0x1A, 'VSM', 0x90A, ...) -- SECURE_KERNEL_ERROR.
+	//
+	SYSTEM_DEVICE_GUARD_INFORMATION dg = { 0 };
+	ULONG returnLength2 = 0;
+	NtQuerySystemInformation(
+		(SYSTEM_INFORMATION_CLASS)0xA5, &dg, sizeof(dg), &returnLength2);
+
+	bool skRunning   = (dg.Flags0 & 0x01) != 0;  // VslIsSecureKernelRunning
+	bool iommuGate   = hvPresent && ((hw6 >> 7) & 1);
+	bool hvIommu     = hvPresent && ((hw6 >> 5) & 1);
+	bool hasSdev     = present[0] != 0;
+
+	printf("\nVTL1 DMA enforcement model:\n");
+	printf("  SecureKernel running    [0xA5 byte0 bit0]  : %s\n",
+		skRunning ? "YES" : "NO");
+	printf("  IOMMU gate              [0x40000006 bit7]  : %s\n",
+		iommuGate ? "YES" : "NO");
+	printf("  HV-managed IOMMU        [0x40000006 bit5]  : %s\n",
+		hvIommu ? "YES" : "NO");
+	printf("  ACPI SDEV table present                    : %s\n",
+		hasSdev ? "YES" : "NO");
+
+	printf("\n  Active model: ");
+	if (skRunning && iommuGate)
+	{
+		printf("VTL1 per-device IOMMU domain enforcement ACTIVE.\n");
+		printf("    All DMA devices placed in VTL1-owned domains at boot (0 pages mapped).\n");
+		printf("    Pages granted only via ShvlMapDeviceGpaPages (HV hypercall 0xB3).\n");
+		printf("    Backed by SLAT; SLAT failure is fatal (SK BugCheck 0x1A / 0x90A).\n");
+		if (hasSdev)
+			printf("    SDEV table present -- securekernel has populated device policy.\n");
+	}
+	else if (hasSdev && !iommuGate)
+	{
+		printf("CONFLICT.\n");
+		printf("    SDEV table present but IOMMU gate (0x40000006[7]) is clear.\n");
+		printf("    securekernel would BugCheck (0xA5/'SDEV') if VBS were enabled.\n");
+	}
+	else if (!skRunning && iommuGate)
+	{
+		printf("HAL-level DMA guard only.\n");
+		printf("    VTL1 not running; securekernel domain model not active.\n");
+		printf("    PnP DMA guard (PiDmaGuardProcessPreStart) is the only enforcement.\n");
+	}
+	else
+	{
+		printf("No IOMMU-backed enforcement active.\n");
+	}
+}
+
 int main()
 {
 	PrintSystemInfo();
@@ -1459,6 +1687,7 @@ int main()
 	PrintStimerCapabilities();
 	PrintVsmAndNestingInfo(NtQuerySystemInformation);
 	PrintDeviceGuardInfo(NtQuerySystemInformation);
+	PrintDmaProtectionDetail(NtQuerySystemInformation);
 	PrintTpmAndCredentialGuardInfo();
 	PrintSpeculationControlInfo(NtQuerySystemInformation);
 	PrintHvDetailInfo(NtQuerySystemInformation);
