@@ -841,9 +841,30 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 	}
 
 	//
-	// 0xD5 -- Secure Speculation (VSM/VTL2 side mitigation state)
+	// 0xD5 -- VTL1 (securekernel) speculation control state.
 	//
-	printf("\nSecure Speculation Control (0xD5 KeQuerySecureSpeculationInformation):\n");
+	// NOTE: there is no VTL2 in standard Windows VBS. Securekernel.exe IS VTL1.
+	// The label "VTL2" in older documentation is incorrect; the correct term is VTL1.
+	//
+	// Data source: SkeQuerySpeculationFeaturesInformation (securekernel.exe), dispatched
+	// as IUM service 258 via VslGetSecureSpeculationControlInformation → ntoskrnl
+	// KeQuerySecureSpeculationInformation.  ntoskrnl applies a non-linear bit remap
+	// before writing the final DWORD, so output bit positions differ from SK source bits.
+	//
+	// SK source bit map (before ntoskrnl remap):
+	//   bit 0  constant 1 (hardcoded sentinel)
+	//   bit 1  SkiKvaShadow != 0  (VTL1 KPTI enabled)
+	//   bit 2  SkiKvaShadowMode == 2  (KPTI, no PCID)
+	//   bit 3  SkiKvaShadowMode == 1  (KPTI + PCID)
+	//   bit 4  SkiFlushPcid & 2      (KPTI + INVPCID)
+	//   bit 5  SkiSpeculationFeatures — IBRS present
+	//   bit 6  SkiBhbFlushSequence != 0 (BHB flush called on every VTL0 return)
+	//   bit 7  SkiSpeculationFeatures — STIBP
+	//   bit 8  SkiSpeculationFeatures — SSBD (via SkiSsbdMsr, typically 0x48)
+	//   bit 17 constant 1 (hardcoded sentinel)
+	//   per-CPU gs:0xAB0 flags feed boundary-enforcement bits (written by SkiUpdateSpeculationControl)
+	//
+	printf("\nSecure Speculation Control (0xD5 -- VTL1 securekernel state):\n");
 	printf("------------------------------------------------------------\n");
 
 	ULONG secspec = 0;
@@ -857,25 +878,25 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 	}
 	else
 	{
-		// Bits 0-15 are a remapped subset of VslGetSecureSpeculationControlInformation().
-		// Bits 2 and 3 are mutually exclusive (VTL2 enforcement vs. report-only).
-		printf("  Raw VTL2 speculation control DWORD: 0x%08X\n", secspec);
-		PrintBit("VTL2 mitigation active         [0]", secspec, 0);
-		PrintBit("VTL2 mitigation enforced       [1]", secspec, 1);
-		PrintBit("VTL2 report-only mode          [2]  (mutually excl. with [3])", secspec, 2);
-		PrintBit("VTL2 enforcement mode          [3]  (mutually excl. with [2])", secspec, 3);
-		PrintBit("VTL2 enhanced IBRS enabled     [4]", secspec, 4);
-		PrintBit("VTL2 IBRS present              [5]", secspec, 5);
-		PrintBit("VTL2 prediction barrier        [6]", secspec, 6);
-		PrintBit("VTL2 STIBP                     [7]", secspec, 7);
-		PrintBit("VTL2 SSBD                      [8]", secspec, 8);
-		PrintBit("VTL2 L1D flush                 [9]", secspec, 9);
-		PrintBit("VTL2 L1D flush not supported  [10]", secspec, 10);
-		PrintBit("VTL2 VPL flush                [11]", secspec, 11);
-		PrintBit("VTL2 VPL flush not supported  [12]", secspec, 12);
-		PrintBit("VTL2 SRBDS mitigation         [13]", secspec, 13);
-		PrintBit("VTL2 TAA mitigation           [14]", secspec, 14);
-		PrintBit("VTL2 MDS mitigation           [15]", secspec, 15);
+		// Positions below are AFTER ntoskrnl's non-linear remap.
+		// Source SK bit 0 and SK bit 17 are hardcoded 1 in SkeQuerySpeculationFeaturesInformation.
+		printf("  Raw VTL1 (securekernel) speculation DWORD: 0x%08X\n", secspec);
+		PrintBit("VTL1 SK sentinel always-1 (hardcoded)          [0]", secspec, 0);
+		PrintBit("VTL1 KPTI active      (SkiKvaShadow != 0)      [1]", secspec, 1);
+		PrintBit("VTL1 KPTI no-PCID     (SkiKvaShadowMode == 2)  [2]", secspec, 2);
+		PrintBit("VTL1 KPTI + PCID      (SkiKvaShadowMode == 1)  [3]", secspec, 3);
+		PrintBit("VTL1 KPTI + INVPCID   (SkiFlushPcid & 2)       [4]", secspec, 4);
+		PrintBit("VTL1 IBRS present                               [5]", secspec, 5);
+		PrintBit("VTL1 BHB flush on VTL0 return (SkiBhbSeq != 0) [6]", secspec, 6);
+		PrintBit("VTL1 STIBP                                      [7]", secspec, 7);
+		PrintBit("VTL1 SSBD (SkiSsbdMsr, typically MSR 0x48)      [8]", secspec, 8);
+		PrintBit("VTL1 L1D flush                                  [9]", secspec, 9);
+		PrintBit("VTL1 L1D flush not applicable                  [10]", secspec, 10);
+		PrintBit("VTL1 STIBP written at VTL boundary (gs:0xAB0)  [11]", secspec, 11);
+		PrintBit("VTL1 IBPB flushed at VTL boundary  (MSR 0x49)  [12]", secspec, 12);
+		PrintBit("VTL1 SRBDS mitigation                          [13]", secspec, 13);
+		PrintBit("VTL1 TAA mitigation                            [14]", secspec, 14);
+		PrintBit("VTL1 MDS mitigation                            [15]", secspec, 15);
 	}
 }
 
@@ -1008,6 +1029,9 @@ void PrintHvDetailInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 	PrintBit("ExtendedGvaRangesForFlush        [15]", hw, 15);
 	PrintBit("XsaveXrstorAvailable             [16]", hw, 16);
 	PrintBit("SupervisorShadowStackAvailable   [17]", hw, 17);
+	// When bit 17 is set, securekernel (ShvlInitSystem) sets ShvlpFlags bit 3,
+	// enabling VTL1 supervisor-mode shadow stacks via HV synthetic VP registers
+	// 0x80008 (SSP), 0x80009 (SSCE entry hook), 0x8000A (SSCE MSR).
 	PrintBit("MbecAvailable                    [18]", hw, 18);
 	PrintBit("GpaSpaceReclaim                  [19]", hw, 19);
 	printf("  EBX=0x%08X  ECX=0x%08X  EDX=0x%08X\n",
@@ -1262,6 +1286,10 @@ void PrintVsmAndNestingInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformatio
 		vsm.HardwareMbecAvailable ? "YES" : "NO");
 	printf("%-40s : %s\n", "APIC virt available     (0xA9[3])",
 		vsm.ApicVirtAvailable ? "YES" : "NO");
+	// APIC virt (0xA9[3]) = CPUID 0x40000006 EAX bit 23.  Separate from the software choice:
+	//   SkiUseX2Apic  : set from IA32_APIC_BASE MSR bit 10 (x2APIC hardware mode active)
+	//   SkiUseApicMsrs: set from CPUID 0x40000004 EAX bit 8 (UseX2ApicMsrs enlightenment)
+	// CPUID 0x40000004[8] (UseX2ApicMsrs) is already printed in the HvDetailInfo section.
 }
 
 // -----------------------------------------------------------------------------
