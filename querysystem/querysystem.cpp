@@ -1671,8 +1671,12 @@ int main()
 	//   +0x00  BYTE   HvlHypervisorConnected  = HvlHypervisorConnected != 0
 	//   +0x01  BYTE   IsRootPartition         = (HvlpRootFlags >> 3) & 1
 	//                                           *** NOT the full HvlpRootFlags DWORD ***
-	//   +0x02  BYTE   IsVmBusPresent          = (HvlpFlags >> 12) & 1
+	//   +0x02  BYTE   IsAnyHypervisorPresent   = (HvlpFlags >> 12) & 1
 	//                                           *** NOT the full HvlpFlags DWORD ***
+	//                                           *** Misleadingly named IsVmBusPresent in earlier docs ***
+	//                                           *** Set in HvlPhase0Initialize from HviIsAnyHypervisorPresent() ***
+	//                                           *** which checks only CPUID.1:ECX[31] (HYPERVISOR_BIT) ***
+	//                                           *** Has NO connection to VMBus -- true under any hypervisor ***
 	//   +0x03  BYTE   SchedulerType           = HvlpSchedulerType low byte
 	//   +0x04  DWORD  Reserved                = 0 (always)
 	//   +0x08  QWORD  HvlEnlightenments       = HvlEnlightenments (32-bit, zero-extended)
@@ -1683,7 +1687,7 @@ int main()
 	{
 		BYTE  HvlHypervisorConnected;
 		BYTE  IsRootPartition;   // (HvlpRootFlags >> 3) & 1
-		BYTE  IsVmBusPresent;    // (HvlpFlags >> 12) & 1
+		BYTE  IsAnyHypervisorPresent; // (HvlpFlags >> 12) & 1 -- set when CPUID.1:ECX[31] is set
 		BYTE  SchedulerType;
 		DWORD Reserved;
 		QWORD HvlEnlightenments;
@@ -1708,8 +1712,15 @@ int main()
 
 	printf("HvlHypervisorConnected : %s\n", info.HvlHypervisorConnected ? "YES" : "NO");
 	printf("IsRootPartition        : %s  [(HvlpRootFlags >> 3) & 1]\n", info.IsRootPartition ? "YES" : "NO");
-	printf("IsVmBusPresent         : %s  [(HvlpFlags >> 12) & 1]\n", info.IsVmBusPresent ? "YES" : "NO");
+	printf("IsAnyHypervisorPresent : %s  [(HvlpFlags >> 12) & 1  CPUID.1:ECX[31]]\n",
+		info.IsAnyHypervisorPresent ? "YES" : "NO");
+	printf("  (Named 'IsVmBusPresent' in older docs but has no VMBus connection;\n");
+	printf("   set by HvlPhase0Initialize from HviIsAnyHypervisorPresent() which\n");
+	printf("   checks only CPUID.1:ECX[31]. Always YES under any hypervisor incl. KVM.)\n");
 	printf("SchedulerType          : %u  (%s)\n", info.SchedulerType, GetSchedulerTypeString(info.SchedulerType));
+	if (info.SchedulerType == 0)
+		printf("  (0 = HvlpSchedulerType not set: HvlpQueryHypervisorSchedulerType\n"
+		       "   calls hypercall 0x7B property 0x0F; returns 0 if not implemented.)\n");
 
 	PrintEnlightenments(info.HvlEnlightenments);
 	PrintStimerCapabilities();
