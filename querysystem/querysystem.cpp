@@ -186,19 +186,40 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 // NtQuerySystemInformation class 0x67 -- code-integrity options.
 // The IUM bit is the definitive indicator that securekernel.exe is running in VTL1.
 //
-// RAW CODE NOTE: the 0x67 handler in ntoskrnl dispatches via a dynamic function
-// pointer (SeCiCallbacks+0x18) populated by ci.dll at boot. The CodeIntegrityOptions
-// DWORD is built inside ci.dll, not in ntoskrnl.exe. Bits 10 and 11 cannot be
-// verified from ntoskrnl.exe.asm alone; their meaning is from the Hyper-V TLFS
-// and observed behaviour.
+// NtQuerySystemInformation(0x67) delegates to ci.dll via SeCiCallbacks[+0x18]
+// (CiQueryInformation, VA 0x1800D1EB0 in Server 2025).
+//
+// Bit 10 (0x400) — HVCI kernel-mode code integrity enforced by hypervisor:
+//   Set when g_CiOptions bit 15 (0x8000) is set.
+//   g_CiOptions bit 15 is set in CiInitializePolicy when:
+//     1. g_HvciSupported != 0  (ntoskrnl passed non-null VslHvciInterface at boot)
+//     2. VslHvciInterface[+0x58]() returns a value with bit 1 set
+//        (securekernel confirming VTL1 KMCI enforcement is active)
+//   Source: ci.dll lines 121782-121790, 300061-300065.
+//
+// Bit 11 (0x800) — HVCI audit mode, hypervisor NOT enforcing:
+//   Set when g_CiDeveloperMode bit 7 (low byte) is set.
+//   g_CiDeveloperMode bit 7 is set when:
+//     1. Registry HvciAuditMode & 1 is set
+//     2. g_CiOptions bit 15 (strict HVCI) is NOT set
+//   Source: ci.dll lines 122510-122516, 300082-300086.
+//   MUTUALLY EXCLUSIVE with bit 10: guard `bt cs:g_CiOptions, 0Fh; jb skip`
+//   at line 122514 prevents bit 11 when bit 10 would be active.
+//
+// ci.dll has NO direct memory-protection calls. All NPT enforcement is in VTL1.
+// Driver image registration with VTL1: ci.dll calls VslHvciInterface[+0x40]
+// (transfer relocation data) which triggers securekernel to mark code pages
+// non-writable in NPT. VslHvciInterface[+0x58] queries KMCI enforcement state.
 //
 #define SYSTEM_CODE_INTEGRITY_INFORMATION_CLASS  0x67
 
 #ifndef CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED
-#  define CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED   0x400  // kernel VBS / HVCI active (ci.dll)
+// bit 10: g_CiOptions bit 15 set → VslHvciInterface[+0x58]() returned bit 1 set
+#  define CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED   0x400
 #endif
 #ifndef CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED
-#  define CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED    0x800  // IUM active = VTL1 running (ci.dll)
+// bit 11: HVCI audit mode (registry) AND strict HVCI NOT active (mutually excl. with bit 10)
+#  define CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED    0x800
 #endif
 // SYSTEM_CODEINTEGRITY_INFORMATION is defined in winternl.h for SDK 10.0.19041+
 // Do not redefine it here.
