@@ -120,8 +120,13 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 // Source: HV204 bit 2.
 #define HV_LPI_CAP_ENLIGHTENMENT                    (1ULL << 18)
 
-// KiInitializeKernel (BSP path): writes 1 to SharedUserData+0x308 to signal
-// user-mode code that the system is running under Hyper-V.
+// HvlpDetermineEnlightenments: sets this bit when CPUID enlightenment data
+// bit 13 is set AND VslGetNestedPageProtectionFlags() returns NPF bit 1.
+// Raw code: `bts ebx, 13h` at ntoskrnl line 1843943.
+// NOTE: the direct write to SharedUserData+0x308 was NOT found within the
+// HvlpDetermineEnlightenments function in the analysed disassembly. The write
+// may occur in KiInitializeKernel which reads HvlEnlightenments bit 19 and
+// copies it to SharedUserData+0x308, but this path was not confirmed by raw code.
 #define HV_SHARED_USER_DATA_HV_FLAG                 (1ULL << 19)
 
 // HvlIsHypercallOverlayLocked: indicates the hypercall overlay page is locked.
@@ -181,13 +186,19 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 // NtQuerySystemInformation class 0x67 -- code-integrity options.
 // The IUM bit is the definitive indicator that securekernel.exe is running in VTL1.
 //
+// RAW CODE NOTE: the 0x67 handler in ntoskrnl dispatches via a dynamic function
+// pointer (SeCiCallbacks+0x18) populated by ci.dll at boot. The CodeIntegrityOptions
+// DWORD is built inside ci.dll, not in ntoskrnl.exe. Bits 10 and 11 cannot be
+// verified from ntoskrnl.exe.asm alone; their meaning is from the Hyper-V TLFS
+// and observed behaviour.
+//
 #define SYSTEM_CODE_INTEGRITY_INFORMATION_CLASS  0x67
 
 #ifndef CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED
-#  define CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED   0x400  // kernel VBS / HVCI active
+#  define CODEINTEGRITY_OPTION_HVCI_KMCI_ENABLED   0x400  // kernel VBS / HVCI active (ci.dll)
 #endif
 #ifndef CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED
-#  define CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED    0x800  // IUM active = VTL1 / secure kernel running
+#  define CODEINTEGRITY_OPTION_HVCI_IUM_ENABLED    0x800  // IUM active = VTL1 running (ci.dll)
 #endif
 // SYSTEM_CODEINTEGRITY_INFORMATION is defined in winternl.h for SDK 10.0.19041+
 // Do not redefine it here.
@@ -205,7 +216,10 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 //                                              Intel: IA32_VMX_EPT_VPID_CAP MSR (48Bh) bit 54
 //                                              AMD:   CPUID(8000000Ah).EDX GMET bit
 //   +0x03  BYTE  ApicVirtAvailable         = HvlpFlags bit 24
-//                                            set when CPUID(40000006h).EAX bit 23
+//                                            Raw code confirmed: `mov al, byte ptr HvlpFlags+3; and al, 1`
+//                                            The link to CPUID(40000006h).EAX bit 23 is from the
+//                                            hypervisor CPUID emulator (hvax64/hvix64), but those
+//                                            function names are RE-assigned and not fully verified.
 //   Minimum buffer: 3 bytes. Maximum meaningful: 4 bytes.
 //
 //
@@ -294,10 +308,22 @@ typedef struct _SYSTEM_SPECULATION_CONTROL_INFORMATION
 } SYSTEM_SPECULATION_CONTROL_INFORMATION;
 
 //
-// NtQuerySystemInformation class 0xD5 (213) -- Secure Speculation Control (VSM/VTL2 side).
-// Verified against KeQuerySecureSpeculationInformation. Minimum: 4 bytes, ReturnLength = 8.
-// Single DWORD. Content is VslGetSecureSpeculationControlInformation() bits 0-19 remapped
-// to output bits 0-15 (non-linearly -- see comments in KeQuerySecureSpeculationInformation).
+// NtQuerySystemInformation class 0xD5 (213) -- VTL1 (securekernel) speculation state.
+// NOTE: "VTL2" in older documentation is WRONG. Securekernel IS VTL1.
+//
+// Handler: KeQuerySecureSpeculationInformation calls VslGetSecureSpeculationControlInformation
+// which dispatches as IUM service 258 to SkeQuerySpeculationFeaturesInformation in securekernel.
+//
+// RAW CODE CONFIRMED (ntoskrnl lines 1922711-1922803): the bit remap is NON-LINEAR with
+// 19 distinct bit remappings. VTL1 bits are NOT passed through directly. Examples:
+//   VTL1 bit 0  → output bit 0   (bits 0-3: direct)
+//   VTL1 bit 8  → output bit 6
+//   VTL1 bit 11 → output bit 12
+//   VTL1 bit 16 → output bit 5
+//   VTL1 bit 17 → output bit 4
+//   VTL1 bit 19 → output bit 15
+// The labels printed below map to the OUTPUT bit positions after ntoskrnl's remap.
+// Minimum: 4 bytes, ReturnLength = 8.
 //
 #define SYSTEM_SECURE_SPECULATION_CONTROL_CLASS  0xD5
 
@@ -368,6 +394,9 @@ typedef struct _HSTI_BLOB_HEADER
 //
 // Byte +1 -- VslIsTrustletRunning + further NPF bits:
 //   bit 0: TrustletRunning         = VslIsTrustletRunning()
+//                                    NOTE: VslIsTrustletRunning makes a LIVE VTL1 call
+//                                    via VslpEnterIumSecureMode(mode=2) and reads field
+//                                    at output+0x10 -- it is not a global flag read.
 //   bit 1: KmciSupplemental        = NPF bit 9
 //   bit 2: KernelShadowStacks      = NPF bit 11 (CET-SS for kernel via VSM)
 //   bit 3: KernelShadowStacksStrict= NPF bit 12
@@ -1286,7 +1315,12 @@ void PrintVsmAndNestingInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformatio
 		vsm.HardwareMbecAvailable ? "YES" : "NO");
 	printf("%-40s : %s\n", "APIC virt available     (0xA9[3])",
 		vsm.ApicVirtAvailable ? "YES" : "NO");
-	// APIC virt (0xA9[3]) = CPUID 0x40000006 EAX bit 23.  Separate from the software choice:
+	// APIC virt (0xA9[3]) = HvlpFlags bit 24 (confirmed by raw code: `mov al, byte ptr HvlpFlags+3; and al, 1`).
+	// Association with CPUID 0x40000006 EAX bit 23: in the hypervisor CPUID emulator (hvax64/hvix64)
+	// raw code shows bit 8 set from an APIC-related byte, while bit 23 comes from a platform
+	// capability check function (RE-assigned name unreliable). The TLFS spec says bit 23 =
+	// ApicVirtualizationAvailable. Treat the bit 23 / APIC mapping as from-spec, not confirmed by raw code.
+	// Separate from the software choice made in securekernel:
 	//   SkiUseX2Apic  : set from IA32_APIC_BASE MSR bit 10 (x2APIC hardware mode active)
 	//   SkiUseApicMsrs: set from CPUID 0x40000004 EAX bit 8 (UseX2ApicMsrs enlightenment)
 	// CPUID 0x40000004[8] (UseX2ApicMsrs) is already printed in the HvDetailInfo section.
