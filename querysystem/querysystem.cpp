@@ -1870,10 +1870,15 @@ void PrintMorAndMorLock()
 	// Errata skip note (kernel global, not readable from user mode)
 	// -----------------------------------------------------------------------
 	printf("\n  Note: PopErrataSkipMemoryOverwriteRequestControlLockAction (ntoskrnl global)\n");
-	printf("    Set by PopReadErrataSkipMemoryOverwriteRequestControlLockAction via\n");
-	printf("    EmClientRuleEvaluate at PoInitSystem. When set, ntoskrnl skips clearing\n");
-	printf("    MOR bits 0+4 on shutdown (firmware has known MORlock bugs).\n");
-	printf("    Not readable from user mode; check via kernel debugger: `dd nt!Pop*Lock*`\n");
+	printf("    Set at PoInitSystem via PopReadErrataSkipMemoryOverwriteRequestControlLockAction\n");
+	printf("    when EmClientRuleEvaluate matches rule {1D7F2399-058C-4FF1-B3B2-81AFED9E838F}.\n");
+	printf("    Reason: specific OEM UEFI firmware has bugs in MORlock handling -- firmware\n");
+	printf("    hangs, errors, or corrupts the variable store on HalSetEnvironmentVariableEx\n");
+	printf("    for MemoryOverwriteRequestControlLock. Identified by BIOS manufacturing date\n");
+	printf("    (EmMatchDate reads BIOS ROM at F000:FFF5 into EmpCachedBiosDate; the INF\n");
+	printf("    database of affected date ranges is embedded in ntoskrnl / passed via loader).\n");
+	printf("    When set, PopSetMemoryOverwriteRequestAction skips the entire MOR clear path.\n");
+	printf("    Not readable from user mode; check via kernel debugger: `db nt!PopErrata*`\n");
 }
 
 // ---------------------------------------------------------------------------
