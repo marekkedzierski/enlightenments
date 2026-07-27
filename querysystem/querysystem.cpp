@@ -380,24 +380,76 @@ typedef struct _SYSTEM_HYPERVISOR_DETAIL_INFORMATION
 
 //
 // NtQuerySystemInformation class 0xA6 (166) -- HSTI (Hardware Security Test Interface).
-// Blob registered at boot by UEFI firmware. Returns STATUS_NOT_FOUND if absent.
-// Required size is dynamic; caller first queries with 0 bytes to get ReturnLength,
-// then re-queries with that size. Blob follows UEFI ADAPTER_INFORMATION_REGISTER spec.
+//
+// SeQueryHSTIResults (ntoskrnl 0x140ADBE08):
+//   *ReturnLength is ALWAYS set to the stored blob size first.
+//   blob_size == 0 → STATUS_NOT_FOUND  (0xC0000225): no HSTI firmware provider.
+//   SystemInformationLength < blob_size → STATUS_BUFFER_TOO_SMALL (0xC0000004).
+//   Sufficient → copies via memmove (or RtlCopyToUser/RtlCopyVolatileMemory when
+//   Feature_HstiUMAFix is enabled, checked per-call).
+//   NOTE: if AV fires during user-mode copy, the exception handler zeroes the return
+//   code → STATUS_SUCCESS is returned even though nothing was copied.
+//
+// Blob sourced from UEFI firmware via winload BlHSTICallProviders (winload.efi):
+//   Enumerates all EFI handles exposing EFI_ADAPTER_INFORMATION_PROTOCOL,
+//   queries each for EFI_ADAPTER_INFO_PLATFORM_SECURITY data (GUID
+//   {6BE272C7-1320-4CCD-9017-D4612C012B25}), validates size >= 0x20C (524 bytes),
+//   builds the compound wrapper blob, saves via BlpPdSaveData.
+//   BapdpProcessHSTIResults retrieves from boot persistence (GUID
+//   {C0D9DF24-D1DD-4E53-95EB-CBD827B86586}), allocates NonPagedPoolNx (pool tag 'HSTI'),
+//   stores pointer permanently in qword_140FF2448 / size in dword_140FF2440.
+//
+// ci.dll CiInstrumentHstiInfo: reads outer blob[+0] and [+4] for ETW telemetry only;
+//   does NOT use HSTI for any code-integrity or security enforcement decisions.
+//
+// THE RETURNED BLOB IS A COMPOUND WRAPPER, not a bare ADAPTER_INFO_PLATFORM_SECURITY:
+//
+//   OUTER BLOB (what NtQuerySystemInformation returns):
+//   +0x00  DWORD  version        = 1
+//   +0x04  DWORD  provider_count = N
+//   +0x08  TOC[N] entries (12 bytes each):
+//            +0x00 DWORD data_offset  (from blob start)
+//            +0x04 DWORD data_size
+//            +0x08 DWORD ntstatus     (EFI call result for this provider)
+//   +0x08+N*12  provider data blobs, 4-byte aligned between entries
+//
+//   INNER ADAPTER_INFO_PLATFORM_SECURITY per provider
+//   (min size 0x20C = 524 confirmed from winload EfiAdapterInformationGetInformation):
+//   +0x000  DWORD    Version
+//   +0x004  DWORD    Role              1 = Platform Manufacturer
+//   +0x008  CHAR16[256] ImplementorName  (512 bytes)
+//   +0x208  DWORD    SecurityFeaturesSize  = S  (bytes per features field)
+//   +0x20C  BYTE[S]  SecurityFeaturesRequired
+//   +0x20C+S BYTE[S] SecurityFeaturesImplemented
+//   +0x20C+2S BYTE[S] SecurityFeaturesVerified
+//   +0x20C+3S WCHAR[] ErrorString
 //
 #define SYSTEM_HSTI_INFORMATION_CLASS  0xA6
 
-typedef struct _HSTI_BLOB_HEADER
-{
-	ULONG  PortType;                       // +0x00 -- 0 = hardware security test
-	ULONG  DataRegionSize;                 // +0x04 -- total blob size in bytes
-	USHORT Role;                           // +0x08 -- 1 = platform manufacturer
-	USHORT ImplementationID;               // +0x0A
-	WCHAR  ImplementorName[8];             // +0x0C -- 16 bytes (8 UTF-16 chars)
-	ULONG  SecurityFeaturesRequired;       // +0x1C -- features firmware claims it must test
-	ULONG  SecurityFeaturesImplemented;    // +0x20 -- features it actually tested
-	ULONG  SecurityFeaturesVerified;       // +0x24 -- features that passed
-	// variable: SecurityFeaturesResultBuffer follows at +0x28
-} HSTI_BLOB_HEADER;
+// Outer compound blob header
+typedef struct _HSTI_OUTER_BLOB {
+	ULONG Version;        // +0x00  always 1
+	ULONG ProviderCount;  // +0x04  N
+} HSTI_OUTER_BLOB;
+
+// Per-provider TOC entry (12 bytes)
+typedef struct _HSTI_TOC_ENTRY {
+	ULONG DataOffset;   // from blob start
+	ULONG DataSize;
+	ULONG NtStatus;     // NTSTATUS from EFI call
+} HSTI_TOC_ENTRY;
+
+// Inner ADAPTER_INFO_PLATFORM_SECURITY (UEFI HSTI spec, min 0x20C bytes)
+typedef struct _HSTI_PROVIDER_BLOB {
+	ULONG Version;               // +0x000
+	ULONG Role;                  // +0x004
+	WCHAR ImplementorName[256];  // +0x008  512 bytes
+	ULONG SecurityFeaturesSize;  // +0x208  S bytes per field
+	// BYTE SecurityFeaturesRequired[S]    follows at +0x20C
+	// BYTE SecurityFeaturesImplemented[S] follows at +0x20C+S
+	// BYTE SecurityFeaturesVerified[S]    follows at +0x20C+2S
+	// WCHAR ErrorString[]                follows at +0x20C+3S
+} HSTI_PROVIDER_BLOB;
 
 //
 // NtQuerySystemInformation class 0xA5 (165) -- Device Guard / VBS flags.
@@ -1093,69 +1145,157 @@ void PrintHstiInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
 	printf("\nHSTI -- Hardware Security Test Interface (0xA6 SeQueryHSTIResults):\n");
 	printf("------------------------------------------------------------\n");
 
-	// Step 1: probe required size (expect STATUS_INFO_LENGTH_MISMATCH + ReturnLength set)
+	// SeQueryHSTIResults always writes blob size to *ReturnLength before any check.
+	// blob absent (size==0) → STATUS_NOT_FOUND.
+	// blob present but buf too small → STATUS_BUFFER_TOO_SMALL + ReturnLength = needed.
 	ULONG blobSize = 0;
-	NtQuerySystemInformation(
+	NTSTATUS st = NtQuerySystemInformation(
 		(SYSTEM_INFORMATION_CLASS)SYSTEM_HSTI_INFORMATION_CLASS,
-		NULL, 0, &blobSize);
+		nullptr, 0, &blobSize);
 
 	if (blobSize == 0)
 	{
-		printf("  No HSTI data registered (firmware did not publish results).\n");
+		// STATUS_NOT_FOUND: no UEFI HSTI provider registered results at boot.
+		printf("  No HSTI data (firmware did not publish ADAPTER_INFO_PLATFORM_SECURITY).\n");
+		return;
+	}
+	if (st != (NTSTATUS)0xC0000004u)
+	{
+		printf("  Unexpected probe result: 0x%X  ReturnLength=%u\n", (UINT)st, blobSize);
 		return;
 	}
 
-	// Step 2: allocate and query
 	BYTE* blob = (BYTE*)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, blobSize);
 	if (!blob)
 	{
-		printf("  Allocation failed for %u bytes.\n", blobSize);
+		printf("  HeapAlloc failed for %u bytes.\n", blobSize);
 		return;
 	}
 
-	ULONG returnLength = 0;
-	NTSTATUS status = NtQuerySystemInformation(
+	ULONG retLen = 0;
+	st = NtQuerySystemInformation(
 		(SYSTEM_INFORMATION_CLASS)SYSTEM_HSTI_INFORMATION_CLASS,
-		blob, blobSize, &returnLength);
+		blob, blobSize, &retLen);
 
-	if (!NT_SUCCESS(status))
+	if (!NT_SUCCESS(st))
 	{
-		printf("  query failed: 0x%X\n", status);
+		printf("  Second query failed: 0x%X\n", (UINT)st);
 		HeapFree(GetProcessHeap(), 0, blob);
 		return;
 	}
 
-	if (returnLength < sizeof(HSTI_BLOB_HEADER))
+	printf("  Compound blob : %u bytes  (pool tag 'HSTI', NonPagedPoolNx)\n", retLen);
+
+	// -----------------------------------------------------------------------
+	// Parse outer compound wrapper
+	// -----------------------------------------------------------------------
+	if (retLen < sizeof(HSTI_OUTER_BLOB))
 	{
-		printf("  Blob too small (%u bytes) to parse header.\n", returnLength);
+		printf("  Blob too small to parse outer header.\n");
 		HeapFree(GetProcessHeap(), 0, blob);
 		return;
 	}
 
-	HSTI_BLOB_HEADER* h = (HSTI_BLOB_HEADER*)blob;
-	char name[9] = { 0 };
-	// ImplementorName is UTF-16; extract ASCII if pure-ASCII
-	for (int i = 0; i < 8; i++)
-		name[i] = (h->ImplementorName[i] < 0x80) ? (char)h->ImplementorName[i] : '?';
+	HSTI_OUTER_BLOB* outer = (HSTI_OUTER_BLOB*)blob;
+	printf("  Outer version    : %u\n", outer->Version);
+	printf("  Provider count   : %u\n", outer->ProviderCount);
 
-	printf("  Blob size         : %u bytes\n", h->DataRegionSize);
-	printf("  ImplementorName   : %s\n", name);
-	printf("  ImplementationID  : 0x%04X\n", h->ImplementationID);
-	printf("  Role              : %u (%s)\n", h->Role, h->Role == 1 ? "Platform Manufacturer" : "unknown");
-	printf("  FeaturesRequired  : 0x%08X\n", h->SecurityFeaturesRequired);
-	printf("  FeaturesImplemented: 0x%08X\n", h->SecurityFeaturesImplemented);
-	printf("  FeaturesVerified  : 0x%08X\n", h->SecurityFeaturesVerified);
+	const ULONG tocOff  = sizeof(HSTI_OUTER_BLOB);
+	const ULONG tocSize = outer->ProviderCount * (ULONG)sizeof(HSTI_TOC_ENTRY);
 
-	// Features not implemented = Required XOR Implemented
-	ULONG notImpl = h->SecurityFeaturesRequired & ~h->SecurityFeaturesImplemented;
-	// Features implemented but not verified = Implemented XOR Verified
-	ULONG notVerif = h->SecurityFeaturesImplemented & ~h->SecurityFeaturesVerified;
-	if (notImpl)
-		printf("  ** Missing implementation for required features: 0x%08X\n", notImpl);
-	if (notVerif)
-		printf("  ** Implemented but not verified: 0x%08X\n", notVerif);
-	if (!notImpl && !notVerif)
-		printf("  All required features implemented and verified.\n");
+	if (retLen < tocOff + tocSize)
+	{
+		printf("  Blob too small to contain %u-entry TOC.\n", outer->ProviderCount);
+		HeapFree(GetProcessHeap(), 0, blob);
+		return;
+	}
+
+	HSTI_TOC_ENTRY* toc = (HSTI_TOC_ENTRY*)(blob + tocOff);
+
+	// -----------------------------------------------------------------------
+	// Walk each provider
+	// -----------------------------------------------------------------------
+	for (ULONG i = 0; i < outer->ProviderCount; i++)
+	{
+		printf("\n  Provider[%u]:\n", i);
+		printf("    data_offset : 0x%X\n", toc[i].DataOffset);
+		printf("    data_size   : %u bytes\n", toc[i].DataSize);
+		printf("    ntstatus    : 0x%X%s\n", toc[i].NtStatus,
+			NT_SUCCESS((NTSTATUS)toc[i].NtStatus) ? "  (OK)" : "  (EFI call failed)");
+
+		if (!NT_SUCCESS((NTSTATUS)toc[i].NtStatus))
+			continue;
+
+		// Bounds check: inner blob must fit within outer blob
+		const ULONG innerMin = (ULONG)offsetof(HSTI_PROVIDER_BLOB, SecurityFeaturesSize)
+		                     + (ULONG)sizeof(ULONG);
+		if (toc[i].DataOffset + toc[i].DataSize > retLen
+			|| toc[i].DataSize < innerMin)
+		{
+			printf("    (provider blob out of bounds or smaller than min %u bytes)\n",
+				innerMin);
+			continue;
+		}
+
+		HSTI_PROVIDER_BLOB* p = (HSTI_PROVIDER_BLOB*)(blob + toc[i].DataOffset);
+
+		// ImplementorName: 256 UTF-16LE chars
+		char name[257] = {};
+		for (int j = 0; j < 256 && p->ImplementorName[j]; j++)
+			name[j] = (p->ImplementorName[j] < 0x80) ? (char)p->ImplementorName[j] : '?';
+
+		printf("    Version         : %u\n", p->Version);
+		printf("    Role            : %u (%s)\n", p->Role,
+			p->Role == 1 ? "Platform Manufacturer" : "unknown");
+		printf("    ImplementorName : %s\n", name);
+		printf("    FeaturesSize    : %u bytes per field\n", p->SecurityFeaturesSize);
+
+		const ULONG S       = p->SecurityFeaturesSize;
+		const ULONG featOff = (ULONG)offsetof(HSTI_PROVIDER_BLOB, SecurityFeaturesSize)
+		                    + (ULONG)sizeof(ULONG);
+
+		if (S == 0 || toc[i].DataSize < featOff + S * 3)
+		{
+			printf("    (feature fields missing or truncated)\n");
+			continue;
+		}
+
+		BYTE* req   = (BYTE*)p + featOff;
+		BYTE* impl  = req  + S;
+		BYTE* verif = impl + S;
+
+		auto printField = [&](const char* label, BYTE* field)
+		{
+			printf("    %-26s: ", label);
+			for (ULONG b = 0; b < S; b += 4)
+			{
+				ULONG dw = 0;
+				ULONG chunk = (S - b < 4) ? (S - b) : 4;
+				memcpy(&dw, field + b, chunk);
+				printf("0x%08X ", dw);
+			}
+			printf("\n");
+		};
+
+		printField("FeaturesRequired",     req);
+		printField("FeaturesImplemented",  impl);
+		printField("FeaturesVerified",     verif);
+
+		// Check for gaps
+		bool anyGap = false;
+		for (ULONG b = 0; b < S; b++)
+		{
+			if ((req[b] & ~impl[b]) || (impl[b] & ~verif[b]))
+			{
+				anyGap = true;
+				break;
+			}
+		}
+		if (anyGap)
+			printf("    ** Gap: some required features not implemented or not verified.\n");
+		else
+			printf("    All required features implemented and verified.\n");
+	}
 
 	HeapFree(GetProcessHeap(), 0, blob);
 }
