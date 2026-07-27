@@ -226,21 +226,30 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 
 //
 // NtQuerySystemInformation class 0xA9 (169) -- VSM protection info.
-// Verified against HvlQueryVsmProtectionInfo at ntoskrnl 0x140A781C8:
+// Verified against HvlQueryVsmProtectionInfo at ntoskrnl 0x140A781C8.
 //
-//   +0x00  BYTE  DmaProtectionAvailable    = HvlpProcessIommu() result
-//   +0x01  BYTE  DmaProtectionInUse        = CPUID(40000006h).EAX >> 7
-//                                            (root partition only; 0 in guest VMs)
-//   +0x02  BYTE  HardwareMbecAvailable     = (HvlpFlags >> 17) & 1
-//                                            set by HvlSetHardwareMbecAvailable via
-//                                            KiSetFeatureBits:
-//                                              Intel: IA32_VMX_EPT_VPID_CAP MSR (48Bh) bit 54
-//                                              AMD:   CPUID(8000000Ah).EDX GMET bit
-//   +0x03  BYTE  ApicVirtAvailable         = HvlpFlags bit 24
-//                                            Raw code confirmed: `mov al, byte ptr HvlpFlags+3; and al, 1`
-//                                            The link to CPUID(40000006h).EAX bit 23 is from the
-//                                            hypervisor CPUID emulator (hvax64/hvix64), but those
-//                                            function names are RE-assigned and not fully verified.
+// TWO PATHS depending on HvlHypervisorConnected AND HvlpFlags bit 1:
+//
+// PATH A (HvlHypervisorConnected != 0 AND HvlpFlags bit 1 set):
+//   Calls HviGetHardwareFeatures → CPUID(40000006h).EAX stored in tmp.
+//   +0x00  DmaProtectionAvailable = (tmp.EAX >> 7) & 1   ← CPUID bit 7, NOT HvlpProcessIommu
+//   +0x01  DmaProtectionInUse     = (tmp.EAX >> 7) & 1   ← same CPUID bit 7
+//   (Both bytes get the same CPUID(40000006h).EAX bit 7 value in this path.)
+//
+// PATH B (no hypervisor, or HvlpFlags bit 1 clear):
+//   +0x00  DmaProtectionAvailable = HvlpProcessIommu() result
+//            → probes ACPI IVRS (AMD) or DMAR (Intel) via NtQuerySystemInformation(0x4C)
+//   +0x01  DmaProtectionInUse     = 0  (no hypervisor to assert in-use)
+//
+// Both paths (confirmed raw code):
+//   +0x02  HardwareMbecAvailable  = (HvlpFlags >> 17) & 1
+//                                   set by HvlSetHardwareMbecAvailable via KiSetFeatureBits:
+//                                     Intel: IA32_VMX_EPT_VPID_CAP MSR (48Bh) bit 54
+//                                     AMD:   CPUID(8000000Ah).EDX GMET bit
+//   +0x03  ApicVirtAvailable      = HvlpFlags bit 24
+//                                   `mov al, byte ptr HvlpFlags+3; and al, 1`
+//                                   CPUID(40000006h) bit 23 is from hypervisor CPUID emulator
+//                                   (hvax64/hvix64) — symbol names user-assigned; code verified.
 //   Minimum buffer: 3 bytes. Maximum meaningful: 4 bytes.
 //
 //
@@ -948,23 +957,36 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 	// NOTE: there is no VTL2 in standard Windows VBS. Securekernel.exe IS VTL1.
 	// The label "VTL2" in older documentation is incorrect; the correct term is VTL1.
 	//
-	// Data source: SkeQuerySpeculationFeaturesInformation (securekernel.exe), dispatched
-	// as IUM service 258 via VslGetSecureSpeculationControlInformation → ntoskrnl
-	// KeQuerySecureSpeculationInformation.  ntoskrnl applies a non-linear bit remap
-	// before writing the final DWORD, so output bit positions differ from SK source bits.
+	// Data source: SkeQuerySpeculationFeaturesInformation (securekernel 0x14008EA18),
+	// dispatched as IUM service 0x102 (258) via:
+	//   KeQuerySecureSpeculationInformation
+	//   → VslGetSecureSpeculationControlInformation (VslpEnterIumSecureMode mode=2)
+	//   → HvlSwitchToVsmVtl1 (VMCALL into VTL1)
+	//   → SkeQuerySpeculationFeaturesInformation
+	// NOTE: SkiUpdateSpeculationControl (different function) writes per-CPU MSRs from
+	// scheduler/init paths. It is NOT on the class 0xD5 query path.
 	//
-	// SK source bit map (before ntoskrnl remap):
-	//   bit 0  constant 1 (hardcoded sentinel)
-	//   bit 1  SkiKvaShadow != 0  (VTL1 KPTI enabled)
-	//   bit 2  SkiKvaShadowMode == 2  (KPTI, no PCID)
-	//   bit 3  SkiKvaShadowMode == 1  (KPTI + PCID)
-	//   bit 4  SkiFlushPcid & 2      (KPTI + INVPCID)
-	//   bit 5  SkiSpeculationFeatures — IBRS present
-	//   bit 6  SkiBhbFlushSequence != 0 (BHB flush called on every VTL0 return)
-	//   bit 7  SkiSpeculationFeatures — STIBP
-	//   bit 8  SkiSpeculationFeatures — SSBD (via SkiSsbdMsr, typically 0x48)
-	//   bit 17 constant 1 (hardcoded sentinel)
-	//   per-CPU gs:0xAB0 flags feed boundary-enforcement bits (written by SkiUpdateSpeculationControl)
+	// ntoskrnl applies a NON-LINEAR bit remap (19 mappings confirmed in
+	// KeQuerySecureSpeculationInformation). SK bits → output bits:
+	//   SK bit  0 → output bit  0   (both are always-1 sentinels)
+	//   SK bit  1 → output bit  1   (KPTI active)
+	//   SK bit  2 → output bit  2   (and mutually clears output bit 3)
+	//   SK bit  3 → output bit  3   (and mutually clears output bit 2)
+	//   SK bit  8 → output bit  6
+	//   SK bit  9 → output bit  7
+	//   SK bit 10 → output bit  8
+	//   SK bit 11 → output bit 12
+	//   SK bit 12 → output bit 13
+	//   SK bit 13 → output bit  9
+	//   SK bit 14 → output bit 10
+	//   SK bit 15 → output bit 11
+	//   SK bit 16 → output bit  5
+	//   SK bit 17 → output bit  4   (always-1 sentinel: `or edx, 20000h` in SK)
+	//   SK bit 18 → output bit 14
+	//   SK bit 19 → output bit 15
+	// SK bits 4-7 mapping to output not yet confirmed (not listed above).
+	// per-CPU gs:0xAB0 flags feed boundary-enforcement bits (written by SkiUpdateSpeculationControl,
+	// read by SkeQuerySpeculationFeaturesInformation during VTL1 query).
 	//
 	printf("\nSecure Speculation Control (0xD5 -- VTL1 securekernel state):\n");
 	printf("------------------------------------------------------------\n");
@@ -980,25 +1002,26 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 	}
 	else
 	{
-		// Positions below are AFTER ntoskrnl's non-linear remap.
-		// Source SK bit 0 and SK bit 17 are hardcoded 1 in SkeQuerySpeculationFeaturesInformation.
+		// Output bit positions are AFTER ntoskrnl KeQuerySecureSpeculationInformation remap.
+		// SK source bits confirmed from code; output bits confirmed from ntoskrnl remap.
+		// Parenthetical SK-bit tag shows the verified SK source for each output bit.
 		printf("  Raw VTL1 (securekernel) speculation DWORD: 0x%08X\n", secspec);
-		PrintBit("VTL1 SK sentinel always-1 (hardcoded)          [0]", secspec, 0);
-		PrintBit("VTL1 KPTI active      (SkiKvaShadow != 0)      [1]", secspec, 1);
-		PrintBit("VTL1 KPTI no-PCID     (SkiKvaShadowMode == 2)  [2]", secspec, 2);
-		PrintBit("VTL1 KPTI + PCID      (SkiKvaShadowMode == 1)  [3]", secspec, 3);
-		PrintBit("VTL1 KPTI + INVPCID   (SkiFlushPcid & 2)       [4]", secspec, 4);
-		PrintBit("VTL1 IBRS present                               [5]", secspec, 5);
-		PrintBit("VTL1 BHB flush on VTL0 return (SkiBhbSeq != 0) [6]", secspec, 6);
-		PrintBit("VTL1 STIBP                                      [7]", secspec, 7);
-		PrintBit("VTL1 SSBD (SkiSsbdMsr, typically MSR 0x48)      [8]", secspec, 8);
-		PrintBit("VTL1 L1D flush                                  [9]", secspec, 9);
-		PrintBit("VTL1 L1D flush not applicable                  [10]", secspec, 10);
-		PrintBit("VTL1 STIBP written at VTL boundary (gs:0xAB0)  [11]", secspec, 11);
-		PrintBit("VTL1 IBPB flushed at VTL boundary  (MSR 0x49)  [12]", secspec, 12);
-		PrintBit("VTL1 SRBDS mitigation                          [13]", secspec, 13);
-		PrintBit("VTL1 TAA mitigation                            [14]", secspec, 14);
-		PrintBit("VTL1 MDS mitigation                            [15]", secspec, 15);
+		PrintBit("VTL1 sentinel always-1           [0] SK-bit0: hardcoded", secspec, 0);
+		PrintBit("VTL1 KPTI active                 [1] SK-bit1: SkiKvaShadow != 0", secspec, 1);
+		PrintBit("VTL1 KPTI no-PCID               [2] SK-bit2: SkiKvaShadowMode == 2", secspec, 2);
+		PrintBit("VTL1 KPTI + PCID                [3] SK-bit3: SkiKvaShadowMode == 1", secspec, 3);
+		PrintBit("VTL1 sentinel always-1           [4] SK-bit17: hardcoded `or edx,20000h`", secspec, 4);
+		PrintBit("VTL1 (SK-bit16)                  [5] SK-bit16: source unconfirmed", secspec, 5);
+		PrintBit("VTL1 (SK-bit8)                   [6] SK-bit8:  source unconfirmed", secspec, 6);
+		PrintBit("VTL1 (SK-bit9)                   [7] SK-bit9:  source unconfirmed", secspec, 7);
+		PrintBit("VTL1 (SK-bit10)                  [8] SK-bit10: source unconfirmed", secspec, 8);
+		PrintBit("VTL1 (SK-bit13)                  [9] SK-bit13: source unconfirmed", secspec, 9);
+		PrintBit("VTL1 (SK-bit14)                 [10] SK-bit14: source unconfirmed", secspec, 10);
+		PrintBit("VTL1 (SK-bit15)                 [11] SK-bit15: source unconfirmed", secspec, 11);
+		PrintBit("VTL1 (SK-bit11)                 [12] SK-bit11: source unconfirmed", secspec, 12);
+		PrintBit("VTL1 (SK-bit12)                 [13] SK-bit12: source unconfirmed", secspec, 13);
+		PrintBit("VTL1 (SK-bit18)                 [14] SK-bit18: source unconfirmed", secspec, 14);
+		PrintBit("VTL1 (SK-bit19)                 [15] SK-bit19: source unconfirmed", secspec, 15);
 	}
 }
 
@@ -1470,6 +1493,9 @@ void PrintVsmAndNestingInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformatio
 
 	printf("%-40s : %s\n", "DMA protection available (0xA9[0])",
 		vsm.DmaProtectionAvailable ? "YES" : "NO");
+	// NOTE: when HvlHypervisorConnected AND HvlpFlags bit 1 set (guest VM path),
+	// BOTH 0xA9[0] and 0xA9[1] = CPUID(40000006h).EAX bit 7 (same value).
+	// When no HV or HvlpFlags bit 1 clear: [0]=HvlpProcessIommu(), [1]=0.
 	printf("%-40s : %s\n", "DMA protection in use   (0xA9[1])",
 		vsm.DmaProtectionInUse ? "YES" : "NO");
 	printf("%-40s : %s\n", "MBEC hardware available (0xA9[2])",
