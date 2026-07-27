@@ -228,20 +228,26 @@ typedef NTSTATUS(WINAPI* PNT_QUERY_SYSTEM_INFORMATION)(
 // NtQuerySystemInformation class 0xA9 (169) -- VSM protection info.
 // Verified against HvlQueryVsmProtectionInfo at ntoskrnl 0x140A781C8.
 //
-// TWO PATHS depending on HvlHypervisorConnected AND HvlpFlags bit 1:
+// THREE PATHS depending on HvlHypervisorConnected AND HvlpFlags bit 1:
 //
-// PATH A (HvlHypervisorConnected != 0 AND HvlpFlags bit 1 set):
+// PATH A (HvlHypervisorConnected == 0):
+//   +0x00  DmaProtectionAvailable = HvlpProcessIommu() result
+//            → probes ACPI IVRS (AMD) or DMAR (Intel) via ZwQuerySystemInformation(0x4C)
+//   +0x01  DmaProtectionInUse     = 0
+//
+// PATH B (HvlHypervisorConnected != 0 AND HvlpFlags bit 1 clear):
+//   +0x00  DmaProtectionAvailable = 1 if (HvlpFlags bit 6 OR HvlpProcessIommu() != 0); else 0
+//   +0x01  DmaProtectionInUse     = (HvlpFlags >> 6) & 1
+//   HvlpFlags bit 6 indicates the hypervisor has asserted IOMMU-managed state even though
+//   the full VSM VTL call interface (HvlpFlags bit 1) is not active.
+//
+// PATH C (HvlHypervisorConnected != 0 AND HvlpFlags bit 1 set):
 //   Calls HviGetHardwareFeatures → CPUID(40000006h).EAX stored in tmp.
-//   +0x00  DmaProtectionAvailable = (tmp.EAX >> 7) & 1   ← CPUID bit 7, NOT HvlpProcessIommu
+//   +0x00  DmaProtectionAvailable = (tmp.EAX >> 7) & 1   ← CPUID bit 7
 //   +0x01  DmaProtectionInUse     = (tmp.EAX >> 7) & 1   ← same CPUID bit 7
 //   (Both bytes get the same CPUID(40000006h).EAX bit 7 value in this path.)
 //
-// PATH B (no hypervisor, or HvlpFlags bit 1 clear):
-//   +0x00  DmaProtectionAvailable = HvlpProcessIommu() result
-//            → probes ACPI IVRS (AMD) or DMAR (Intel) via NtQuerySystemInformation(0x4C)
-//   +0x01  DmaProtectionInUse     = 0  (no hypervisor to assert in-use)
-//
-// Both paths (confirmed raw code):
+// All three paths (confirmed raw code):
 //   +0x02  HardwareMbecAvailable  = (HvlpFlags >> 17) & 1
 //                                   set by HvlSetHardwareMbecAvailable via KiSetFeatureBits:
 //                                     Intel: IA32_VMX_EPT_VPID_CAP MSR (48Bh) bit 54
@@ -966,25 +972,27 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 	// NOTE: SkiUpdateSpeculationControl (different function) writes per-CPU MSRs from
 	// scheduler/init paths. It is NOT on the class 0xD5 query path.
 	//
-	// ntoskrnl applies a NON-LINEAR bit remap (19 mappings confirmed in
-	// KeQuerySecureSpeculationInformation). SK bits → output bits:
-	//   SK bit  0 → output bit  0   (both are always-1 sentinels)
-	//   SK bit  1 → output bit  1   (KPTI active)
-	//   SK bit  2 → output bit  2   (and mutually clears output bit 3)
-	//   SK bit  3 → output bit  3   (and mutually clears output bit 2)
-	//   SK bit  8 → output bit  6
-	//   SK bit  9 → output bit  7
-	//   SK bit 10 → output bit  8
-	//   SK bit 11 → output bit 12
-	//   SK bit 12 → output bit 13
-	//   SK bit 13 → output bit  9
-	//   SK bit 14 → output bit 10
-	//   SK bit 15 → output bit 11
-	//   SK bit 16 → output bit  5
+	// ntoskrnl applies a NON-LINEAR bit remap (16 remap pairs, 18 total bit operations
+	// including 2 complementary clears, confirmed in KeQuerySecureSpeculationInformation).
+	// SK bits → output bits (SK source confirmed from securekernel disassembly):
+	//   SK bit  0 → output bit  0   (always-1 sentinel: hardcoded in SK)
+	//   SK bit  1 → output bit  1   (SkiKvaShadow != 0)
+	//   SK bit  2 → output bit  2   (SkiKvaShadowMode == 2; mutually clears output bit 3)
+	//   SK bit  3 → output bit  3   (SkiKvaShadowMode == 1; mutually clears output bit 2)
+	//   SK bit  4 = SkiKvaShadowMode == 1 AND SkiFlushPcid bit 1 — DROPPED by ntoskrnl (no output bit)
+	//   SK bits 5-7: not set by SkeQuerySpeculationFeaturesInformation
+	//   SK bit  8 → output bit  6   (!SkiSpeculationFeatures[16] && !SkiSpeculationFeatures[17])
+	//   SK bit  9 → output bit  7   (SkiSpeculationFeatures[4])
+	//   SK bit 10 → output bit  8   (SkiSpeculationFeatures[0])
+	//   SK bit 11 → output bit 12   (per-CPU gs:0xAB0 bit 1)
+	//   SK bit 12 → output bit 13   (per-CPU gs:0xAB0 bit 2)
+	//   SK bit 13 → output bit  9   (SkiSpeculationFeatures[6])
+	//   SK bit 14 → output bit 10   (SkiSpeculationFeatures[7])
+	//   SK bit 15 → output bit 11   (NOT SkiSpeculationFeatures[8] — inverted)
+	//   SK bit 16 → output bit  5   (always-1 sentinel: `or ecx, 200h` then `shl ecx, 7`)
 	//   SK bit 17 → output bit  4   (always-1 sentinel: `or edx, 20000h` in SK)
-	//   SK bit 18 → output bit 14
-	//   SK bit 19 → output bit 15
-	// SK bits 4-7 mapping to output not yet confirmed (not listed above).
+	//   SK bit 18 → output bit 14   (SkiSpeculationFeatures[9] OR SkiSpeculationFeatures[13])
+	//   SK bit 19 → output bit 15   (SkiSpeculationFeatures[12])
 	// per-CPU gs:0xAB0 flags feed boundary-enforcement bits (written by SkiUpdateSpeculationControl,
 	// read by SkeQuerySpeculationFeaturesInformation during VTL1 query).
 	//
@@ -1006,22 +1014,22 @@ void PrintSpeculationControlInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInfor
 		// SK source bits confirmed from code; output bits confirmed from ntoskrnl remap.
 		// Parenthetical SK-bit tag shows the verified SK source for each output bit.
 		printf("  Raw VTL1 (securekernel) speculation DWORD: 0x%08X\n", secspec);
-		PrintBit("VTL1 sentinel always-1           [0] SK-bit0: hardcoded", secspec, 0);
-		PrintBit("VTL1 KPTI active                 [1] SK-bit1: SkiKvaShadow != 0", secspec, 1);
-		PrintBit("VTL1 KPTI no-PCID               [2] SK-bit2: SkiKvaShadowMode == 2", secspec, 2);
-		PrintBit("VTL1 KPTI + PCID                [3] SK-bit3: SkiKvaShadowMode == 1", secspec, 3);
-		PrintBit("VTL1 sentinel always-1           [4] SK-bit17: hardcoded `or edx,20000h`", secspec, 4);
-		PrintBit("VTL1 (SK-bit16)                  [5] SK-bit16: source unconfirmed", secspec, 5);
-		PrintBit("VTL1 (SK-bit8)                   [6] SK-bit8:  source unconfirmed", secspec, 6);
-		PrintBit("VTL1 (SK-bit9)                   [7] SK-bit9:  source unconfirmed", secspec, 7);
-		PrintBit("VTL1 (SK-bit10)                  [8] SK-bit10: source unconfirmed", secspec, 8);
-		PrintBit("VTL1 (SK-bit13)                  [9] SK-bit13: source unconfirmed", secspec, 9);
-		PrintBit("VTL1 (SK-bit14)                 [10] SK-bit14: source unconfirmed", secspec, 10);
-		PrintBit("VTL1 (SK-bit15)                 [11] SK-bit15: source unconfirmed", secspec, 11);
-		PrintBit("VTL1 (SK-bit11)                 [12] SK-bit11: source unconfirmed", secspec, 12);
-		PrintBit("VTL1 (SK-bit12)                 [13] SK-bit12: source unconfirmed", secspec, 13);
-		PrintBit("VTL1 (SK-bit18)                 [14] SK-bit18: source unconfirmed", secspec, 14);
-		PrintBit("VTL1 (SK-bit19)                 [15] SK-bit19: source unconfirmed", secspec, 15);
+		PrintBit("VTL1 sentinel always-1           [0] SK0:  hardcoded", secspec, 0);
+		PrintBit("VTL1 KPTI active                 [1] SK1:  SkiKvaShadow != 0", secspec, 1);
+		PrintBit("VTL1 KPTI no-PCID               [2] SK2:  SkiKvaShadowMode == 2", secspec, 2);
+		PrintBit("VTL1 KPTI + PCID                [3] SK3:  SkiKvaShadowMode == 1", secspec, 3);
+		PrintBit("VTL1 sentinel always-1           [4] SK17: or edx,20000h", secspec, 4);
+		PrintBit("VTL1 sentinel always-1           [5] SK16: or ecx,200h + shl 7", secspec, 5);
+		PrintBit("VTL1 !SF[16]&&!SF[17]            [6] SK8:  SkiSpeculationFeatures", secspec, 6);
+		PrintBit("VTL1 SF[4]                       [7] SK9:  SkiSpeculationFeatures", secspec, 7);
+		PrintBit("VTL1 SF[0]                       [8] SK10: SkiSpeculationFeatures", secspec, 8);
+		PrintBit("VTL1 SF[6]                       [9] SK13: SkiSpeculationFeatures", secspec, 9);
+		PrintBit("VTL1 SF[7]                      [10] SK14: SkiSpeculationFeatures", secspec, 10);
+		PrintBit("VTL1 NOT SF[8]                  [11] SK15: !SkiSpeculationFeatures[8]", secspec, 11);
+		PrintBit("VTL1 per-CPU gs:0xAB0[1]        [12] SK11: boundary enforcement", secspec, 12);
+		PrintBit("VTL1 per-CPU gs:0xAB0[2]        [13] SK12: boundary enforcement", secspec, 13);
+		PrintBit("VTL1 SF[9]||SF[13]              [14] SK18: SkiSpeculationFeatures", secspec, 14);
+		PrintBit("VTL1 SF[12]                     [15] SK19: SkiSpeculationFeatures", secspec, 15);
 	}
 }
 
@@ -1493,9 +1501,10 @@ void PrintVsmAndNestingInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformatio
 
 	printf("%-40s : %s\n", "DMA protection available (0xA9[0])",
 		vsm.DmaProtectionAvailable ? "YES" : "NO");
-	// NOTE: when HvlHypervisorConnected AND HvlpFlags bit 1 set (guest VM path),
-	// BOTH 0xA9[0] and 0xA9[1] = CPUID(40000006h).EAX bit 7 (same value).
-	// When no HV or HvlpFlags bit 1 clear: [0]=HvlpProcessIommu(), [1]=0.
+	// THREE PATHS: (C) HvlHypervisorConnected AND HvlpFlags bit 1 set → both [0]+[1]
+	// = CPUID(40000006h).EAX bit 7. (B) HV connected but bit 1 clear → [0] = 1 if
+	// (HvlpFlags bit 6 OR HvlpProcessIommu()), [1] = HvlpFlags bit 6. (A) No HV →
+	// [0] = HvlpProcessIommu(), [1] = 0.
 	printf("%-40s : %s\n", "DMA protection in use   (0xA9[1])",
 		vsm.DmaProtectionInUse ? "YES" : "NO");
 	printf("%-40s : %s\n", "MBEC hardware available (0xA9[2])",
@@ -1503,10 +1512,11 @@ void PrintVsmAndNestingInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformatio
 	printf("%-40s : %s\n", "APIC virt available     (0xA9[3])",
 		vsm.ApicVirtAvailable ? "YES" : "NO");
 	// APIC virt (0xA9[3]) = HvlpFlags bit 24 (confirmed by raw code: `mov al, byte ptr HvlpFlags+3; and al, 1`).
-	// Association with CPUID 0x40000006 EAX bit 23: in the hypervisor CPUID emulator (hvax64/hvix64)
-	// raw code shows bit 8 set from an APIC-related byte, while bit 23 comes from a platform
-	// capability check function (RE-assigned name unreliable). The TLFS spec says bit 23 =
-	// ApicVirtualizationAvailable. Treat the bit 23 / APIC mapping as from-spec, not confirmed by raw code.
+	// In hvax64/hvix64, CPUID 0x40000006 EAX bit 23 = a platform capability check (RE-assigned
+	// name "HcpCheckPlatformXsaveCapability" unreliable). Actual code checks a VSM-related
+	// global AND excludes based on partition flags (bit 15 on both; bit 2 additionally on AMD).
+	// The TLFS spec says bit 23 = ApicVirtualizationAvailable.
+	// Treat the bit 23 / APIC mapping as from-spec; HV code shows VSM-conditional sourcing.
 	// Separate from the software choice made in securekernel:
 	//   SkiUseX2Apic  : set from IA32_APIC_BASE MSR bit 10 (x2APIC hardware mode active)
 	//   SkiUseApicMsrs: set from CPUID 0x40000004 EAX bit 8 (UseX2ApicMsrs enlightenment)
