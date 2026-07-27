@@ -1710,6 +1710,173 @@ void PrintDmaProtectionDetail(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformat
 }
 
 // ---------------------------------------------------------------------------
+// PrintMorAndMorLock -- TCG Memory Overwrite Request (MOR) and MORlock state
+//
+// MOR -- MemoryOverwriteRequestControl:
+//   Name : "MemoryOverwriteRequestControl"
+//   GUID : {E20939BE-32D4-41BE-A150-897F85D49829}  (TCG Platform Reset spec; EfiMorBitVariable)
+//   Size : 1 byte
+//   bit 0 (MOR bit): 1 = firmware must overwrite memory at next boot (cold-boot defence)
+//   bit 4 : cleared by ntoskrnl alongside bit 0 on clean shutdown / hibernate start
+//
+//   winload BlTcgFwSetMemoryOverwriteRequestBit (winload.efi 0x1801A4C7F):
+//     Reads current value (EfiGetVariable, size=1).  Then:
+//       bl=0 → sets byte to 0x01  (bit 0 only)
+//       bl≠0 → sets byte to 0x11  (bits 0 and 4)
+//     Called from winload to arm MOR before kernel launch.
+//
+//   ntoskrnl PopSetMemoryOverwriteRequestAction (ntoskrnl 0x140B529D4):
+//     Reads via HalGetEnvironmentVariableEx, then `and byte, 0xEEh` (clears bits 0 and 4),
+//     writes back via HalSetEnvironmentVariableEx.
+//     Skipped entirely if PopErrataSkipMemoryOverwriteRequestControlLockAction != 0
+//     (set by PopReadErrataSkipMemoryOverwriteRequestControlLockAction via EmClientRuleEvaluate
+//     for firmware known to have MORlock bugs).
+//     Called from PopShutdownSystem and PopSaveHiberContext.
+//
+// MORlock -- MemoryOverwriteRequestControlLock:
+//   Name : "MemoryOverwriteRequestControlLock"
+//   GUID : {BB983CCF-151D-40E1-A07B-4A17BE168292}  (TCG spec v1.10; EfiMorLockVariable)
+//   Size : 1 byte (v1) or 8 bytes (v2 with key)
+//     0 = unlocked   -- software may change MOR
+//     1 = locked, no key -- MOR is read-only until next boot (cannot be changed)
+//     2 = locked with key -- unlockable only with 8-byte key (MORlock v2)
+//
+//   winload BlTcgFwSetAndLockMemoryOverwriteRequestControl (winload.efi 0x1801A4D60):
+//     Reads MORlock (size=1 expected).  STATUS_NOT_FOUND (0xC0000023) → variable absent.
+//     If value==0: locks by writing 0x01 (no-key) or 8-byte key (v2 with key).
+//     If value==1 or 2: already locked → returns ACCESS_DENIED (0xC0000022).
+//     After locking, reads back to confirm value==2 (success) before recording config event.
+//     Called after BlTcgFwSetMemoryOverwriteRequestBit so MOR is armed before locking.
+//
+// Requires SeSystemEnvironmentPrivilege (administrator elevation).
+// ---------------------------------------------------------------------------
+
+void PrintMorAndMorLock()
+{
+	printf("\nMOR / MORlock -- TCG Platform Reset Attack Mitigation:\n");
+	printf("------------------------------------------------------------\n");
+
+	// Enable SeSystemEnvironmentPrivilege (required for GetFirmwareEnvironmentVariable*).
+	BOOL privileged = FALSE;
+	{
+		HANDLE hTok;
+		if (OpenProcessToken(GetCurrentProcess(),
+			TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hTok))
+		{
+			LUID luid = {};
+			if (LookupPrivilegeValueW(nullptr, SE_SYSTEM_ENVIRONMENT_NAME, &luid))
+			{
+				TOKEN_PRIVILEGES tp = { 1, { luid, SE_PRIVILEGE_ENABLED } };
+				if (AdjustTokenPrivileges(hTok, FALSE, &tp, sizeof(tp), nullptr, nullptr)
+					&& GetLastError() == ERROR_SUCCESS)
+					privileged = TRUE;
+			}
+			CloseHandle(hTok);
+		}
+	}
+
+	if (!privileged)
+	{
+		printf("  SeSystemEnvironmentPrivilege unavailable -- run as administrator.\n");
+		return;
+	}
+
+	// -----------------------------------------------------------------------
+	// MOR -- MemoryOverwriteRequestControl
+	// GUID {E20939BE-32D4-41BE-A150-897F85D49829}  (EfiMorBitVariable)
+	// -----------------------------------------------------------------------
+	printf("\n  MemoryOverwriteRequestControl (MOR):\n");
+	printf("    GUID : {E20939BE-32D4-41BE-A150-897F85D49829}\n");
+
+	BYTE   morValue  = 0;
+	DWORD  morAttrib = 0;
+	DWORD  morSize   = GetFirmwareEnvironmentVariableExW(
+		L"MemoryOverwriteRequestControl",
+		L"{E20939BE-32D4-41BE-A150-897F85D49829}",
+		&morValue, sizeof(morValue), &morAttrib);
+
+	if (morSize == 0)
+	{
+		DWORD err = GetLastError();
+		if (err == ERROR_ENVVAR_NOT_FOUND)
+			printf("    Value : (absent -- firmware does not support MOR)\n");
+		else
+			printf("    Query failed: 0x%X\n", err);
+	}
+	else
+	{
+		printf("    Raw byte  : 0x%02X\n", morValue);
+		printf("    bit 0 MOR : %u  -- %s\n", morValue & 1,
+			(morValue & 1)
+				? "ACTIVE -- firmware must overwrite RAM at next boot"
+				: "clear (no overwrite requested)");
+		printf("    bit 4     : %u  (cleared by ntoskrnl alongside bit 0 on shutdown)\n",
+			(morValue >> 4) & 1);
+		printf("    Attributes: 0x%X  (%s%s%s)\n", morAttrib,
+			(morAttrib & 1) ? "NonVolatile " : "",
+			(morAttrib & 2) ? "BootSvc " : "",
+			(morAttrib & 4) ? "RuntimeSvc" : "");
+	}
+
+	// -----------------------------------------------------------------------
+	// MORlock -- MemoryOverwriteRequestControlLock
+	// GUID {BB983CCF-151D-40E1-A07B-4A17BE168292}  (EfiMorLockVariable)
+	// -----------------------------------------------------------------------
+	printf("\n  MemoryOverwriteRequestControlLock (MORlock):\n");
+	printf("    GUID : {BB983CCF-151D-40E1-A07B-4A17BE168292}\n");
+
+	BYTE  lockBuf[8] = {};
+	DWORD lockAttrib = 0;
+	DWORD lockSize   = GetFirmwareEnvironmentVariableExW(
+		L"MemoryOverwriteRequestControlLock",
+		L"{BB983CCF-151D-40E1-A07B-4A17BE168292}",
+		lockBuf, sizeof(lockBuf), &lockAttrib);
+
+	if (lockSize == 0)
+	{
+		DWORD err = GetLastError();
+		if (err == ERROR_ENVVAR_NOT_FOUND)
+			printf("    Value : (absent -- firmware does not implement MORlock)\n");
+		else
+			printf("    Query failed: 0x%X\n", err);
+	}
+	else if (lockSize == 1)
+	{
+		printf("    Size  : 1 byte  (MORlock v1)\n");
+		printf("    Raw   : 0x%02X\n", lockBuf[0]);
+		printf("    State : %s\n",
+			lockBuf[0] == 0 ? "UNLOCKED -- software may change MOR" :
+			lockBuf[0] == 1 ? "LOCKED (no key) -- MOR read-only until reboot" :
+			lockBuf[0] == 2 ? "LOCKED WITH KEY -- 8-byte key required (MORlock v2)" :
+			                  "unknown value");
+		printf("    Attributes: 0x%X\n", lockAttrib);
+	}
+	else if (lockSize == 8)
+	{
+		printf("    Size  : 8 bytes  (MORlock v2 -- key present)\n");
+		printf("    Key   : ");
+		for (DWORD i = 0; i < 8; i++) printf("%02X ", lockBuf[i]);
+		printf("\n    State : LOCKED WITH KEY\n");
+		printf("    Attributes: 0x%X\n", lockAttrib);
+	}
+	else
+	{
+		printf("    Size  : %u bytes (unexpected)\n", lockSize);
+		for (DWORD i = 0; i < lockSize && i < 16; i++) printf("%02X ", lockBuf[i]);
+		printf("\n");
+	}
+
+	// -----------------------------------------------------------------------
+	// Errata skip note (kernel global, not readable from user mode)
+	// -----------------------------------------------------------------------
+	printf("\n  Note: PopErrataSkipMemoryOverwriteRequestControlLockAction (ntoskrnl global)\n");
+	printf("    Set by PopReadErrataSkipMemoryOverwriteRequestControlLockAction via\n");
+	printf("    EmClientRuleEvaluate at PoInitSystem. When set, ntoskrnl skips clearing\n");
+	printf("    MOR bits 0+4 on shutdown (firmware has known MORlock bugs).\n");
+	printf("    Not readable from user mode; check via kernel debugger: `dd nt!Pop*Lock*`\n");
+}
+
+// ---------------------------------------------------------------------------
 // PrintSystemBasicInfo -- NtQuerySystemInformation class 0 (SystemBasicInformation)
 //
 // Sources verified against ntoskrnl ExpGetSystemBasicInformation (0x14044DA5C)
@@ -1887,6 +2054,7 @@ int main()
 	PrintEnlightenments(info.HvlEnlightenments);
 	PrintStimerCapabilities();
 	PrintVsmAndNestingInfo(NtQuerySystemInformation);
+	PrintMorAndMorLock();
 	PrintSystemBasicInfo(NtQuerySystemInformation);
 	PrintDeviceGuardInfo(NtQuerySystemInformation);
 	PrintDmaProtectionDetail(NtQuerySystemInformation);
