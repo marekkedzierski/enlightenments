@@ -1709,6 +1709,113 @@ void PrintDmaProtectionDetail(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformat
 	}
 }
 
+// ---------------------------------------------------------------------------
+// PrintSystemBasicInfo -- NtQuerySystemInformation class 0 (SystemBasicInformation)
+//
+// Sources verified against ntoskrnl ExpGetSystemBasicInformation (0x14044DA5C)
+// and securekernel IumpSanitizeSystemBasicInfo (called after NkQuerySystemInformation).
+//
+// Structure layout (0x40 = 64 bytes; confirmed from ntoskrnl write offsets):
+//   +0x00  ULONG   Reserved                  = 0 (always)
+//   +0x04  ULONG   TimerResolution            = KeMaximumIncrement (100ns units)
+//   +0x08  ULONG   PageSize                   = 0x1000 (hardcoded)
+//   +0x0C  ULONG   NumberOfPhysicalPages      = MmGetNumberOfPhysicalPages (capped 0xFFFFFFFF)
+//   +0x10  ULONG   LowestPhysicalPageNumber   = MiNode->LowestPfn (capped 0xFFFFFFFF)
+//   +0x14  ULONG   HighestPhysicalPageNumber  = MiNode->HighestPfn (capped 0xFFFFFFFF)
+//   +0x18  ULONG   AllocationGranularity      = 0x10000 (hardcoded)
+//   +0x1C  ULONG   _Pad                       (implicit: QWORD alignment for +0x20)
+//   +0x20  QWORD   MinimumUserModeAddress     = 0x10000 (hardcoded)
+//   +0x28  QWORD   MaximumUserModeAddress     = 0x7FFFFFFEFFFFh (hardcoded)
+//   +0x30  QWORD   ActiveProcessorsAffinityMask = KeActiveProcessors (NUMA node 0)
+//   +0x38  CHAR    NumberOfProcessors         = popcount(AffinityMask)
+//   +0x39  CHAR[7] _Pad2
+//
+// Securekernel IumpSanitizeSystemBasicInfo enforcement (called after VTL0 result arrives):
+//   [+08] PageSize               <- 0x1000  (defensive; same value ntoskrnl hardcodes)
+//   [+18] AllocationGranularity  <- 0x10000 (defensive; same value ntoskrnl hardcodes)
+//   [+20] MinimumUserModeAddress <- 0x10000 (defensive; same value ntoskrnl hardcodes)
+//   [+28] MaximumUserModeAddress <- 0x7FFFFFFEFFFFh (defensive; same as ntoskrnl)
+//   [+38] NumberOfProcessors     clamped to <= 0x40 (VTL1 supports max 64 logical processors)
+//
+// ClassID 0x3E remapping: securekernel remaps class 0x3E to class 0 internally:
+//   `cmp ebx, 3Eh; cmovnz edi, ebx` -- if class==0x3E, edi stays 0; else edi=class.
+// ---------------------------------------------------------------------------
+
+void PrintSystemBasicInfo(PNT_QUERY_SYSTEM_INFORMATION NtQuerySystemInformation)
+{
+	printf("\nSystem Basic Information (0x00 ExpGetSystemBasicInformation):\n");
+	printf("------------------------------------------------------------\n");
+
+	typedef struct _SYSTEM_BASIC_INFORMATION_LOCAL {
+		ULONG    Reserved;
+		ULONG    TimerResolution;
+		ULONG    PageSize;
+		ULONG    NumberOfPhysicalPages;
+		ULONG    LowestPhysicalPageNumber;
+		ULONG    HighestPhysicalPageNumber;
+		ULONG    AllocationGranularity;
+		ULONG    _Pad;                       // implicit 4-byte pad before QWORD
+		ULONG64  MinimumUserModeAddress;
+		ULONG64  MaximumUserModeAddress;
+		ULONG64  ActiveProcessorsAffinityMask;
+		CHAR     NumberOfProcessors;
+		CHAR     _Pad2[7];
+	} SYSTEM_BASIC_INFORMATION_LOCAL;
+
+	static_assert(offsetof(SYSTEM_BASIC_INFORMATION_LOCAL, MinimumUserModeAddress) == 0x20, "layout");
+	static_assert(offsetof(SYSTEM_BASIC_INFORMATION_LOCAL, MaximumUserModeAddress) == 0x28, "layout");
+	static_assert(offsetof(SYSTEM_BASIC_INFORMATION_LOCAL, NumberOfProcessors)     == 0x38, "layout");
+	static_assert(sizeof(SYSTEM_BASIC_INFORMATION_LOCAL) == 0x40, "size");
+
+	SYSTEM_BASIC_INFORMATION_LOCAL bi = {};
+	ULONG returnLength = 0;
+	NTSTATUS status = NtQuerySystemInformation(
+		(SYSTEM_INFORMATION_CLASS)0,
+		&bi, sizeof(bi), &returnLength);
+
+	if (!NT_SUCCESS(status))
+	{
+		printf("  query failed: 0x%X\n", status);
+		return;
+	}
+
+	printf("  [+00] Reserved                        : 0x%08X\n", bi.Reserved);
+	printf("  [+04] TimerResolution  (100ns units)  : %u  (%.3f ms)\n",
+		bi.TimerResolution, (double)bi.TimerResolution / 10000.0);
+	printf("  [+08] PageSize                        : 0x%X  %s\n",
+		bi.PageSize,
+		bi.PageSize == 0x1000 ? "(hardcoded by ntoskrnl + SK)" : "(!= expected 0x1000)");
+	printf("  [+0C] NumberOfPhysicalPages           : %u  (%.1f GB)\n",
+		bi.NumberOfPhysicalPages,
+		(double)bi.NumberOfPhysicalPages * bi.PageSize / (1024.0 * 1024.0 * 1024.0));
+	printf("  [+10] LowestPhysicalPageNumber        : 0x%X\n", bi.LowestPhysicalPageNumber);
+	printf("  [+14] HighestPhysicalPageNumber       : 0x%X\n", bi.HighestPhysicalPageNumber);
+	printf("  [+18] AllocationGranularity           : 0x%X  %s\n",
+		bi.AllocationGranularity,
+		bi.AllocationGranularity == 0x10000 ? "(hardcoded)" : "(!= expected 0x10000)");
+	printf("  [+1C] _Pad                            : (4 bytes implicit alignment)\n");
+	printf("  [+20] MinimumUserModeAddress          : 0x%016llX  %s\n",
+		(unsigned long long)bi.MinimumUserModeAddress,
+		bi.MinimumUserModeAddress == 0x10000ULL ? "(hardcoded)" : "(!= expected 0x10000)");
+	printf("  [+28] MaximumUserModeAddress          : 0x%016llX  %s\n",
+		(unsigned long long)bi.MaximumUserModeAddress,
+		bi.MaximumUserModeAddress == 0x7FFFFFFEFFFFull ? "(hardcoded ~127TB limit)" : "(!= expected 0x7FFFFFFEFFFFh)");
+	printf("  [+30] ActiveProcessorsAffinityMask    : 0x%016llX\n",
+		(unsigned long long)bi.ActiveProcessorsAffinityMask);
+	printf("  [+38] NumberOfProcessors              : %u  %s\n",
+		(unsigned char)bi.NumberOfProcessors,
+		(unsigned char)bi.NumberOfProcessors > 64
+			? "(SK would clamp to 64 for VTL1 trustlets)" : "(SK limit ≤ 64 OK)");
+
+	printf("\n  SecureKernel IumpSanitizeSystemBasicInfo -- VTL1 enforcement:\n");
+	printf("    [+08] PageSize               <- 0x1000         (defensive; matches ntoskrnl)\n");
+	printf("    [+18] AllocationGranularity  <- 0x10000        (defensive; matches ntoskrnl)\n");
+	printf("    [+20] MinimumUserModeAddress <- 0x10000        (defensive; matches ntoskrnl)\n");
+	printf("    [+28] MaximumUserModeAddress <- 0x7FFFFFFEFFFFh(defensive; matches ntoskrnl)\n");
+	printf("    [+38] NumberOfProcessors     clamped to <= 64  (VTL1 max 64 LPs)\n");
+	printf("  Class 0x3E is remapped to class 0 in securekernel (cmp 0x3E; cmovnz guard).\n");
+}
+
 int main()
 {
 	PrintSystemInfo();
@@ -1780,6 +1887,7 @@ int main()
 	PrintEnlightenments(info.HvlEnlightenments);
 	PrintStimerCapabilities();
 	PrintVsmAndNestingInfo(NtQuerySystemInformation);
+	PrintSystemBasicInfo(NtQuerySystemInformation);
 	PrintDeviceGuardInfo(NtQuerySystemInformation);
 	PrintDmaProtectionDetail(NtQuerySystemInformation);
 	PrintTpmAndCredentialGuardInfo();
