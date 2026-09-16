@@ -1,0 +1,866 @@
+================================================================================
+  VSM / VTL1 Secure Speculation Control Fields
+  Undocumented internals of NtQuerySystemInformation class 0xD5
+  (SystemSecureSpeculationControlInformation)
+================================================================================
+
+  Sources: securekernel.exe, ntoskrnl.exe, hvax64.exe IDA disassembly (AMD platform)
+  All symbol names in securekernel/hypervisor are reverse-engineered (not available
+  from Microsoft). Verification is based on instruction-level analysis, not symbol names.
+
+
+TABLE OF CONTENTS
+=================
+  1. Overview: What class 0xD5 reports
+  2. The query pipeline (who calls whom)
+  3. SkiSpeculationFeatures — the master decision variable
+  4. gs:0xAB0 — per-CPU boundary enforcement byte
+  5. gs:0xAB2..0xABA — per-CPU SPEC_CTRL cache
+  6. SkiUpdateSpeculationControl — the sole actuator
+  7. SkeQuerySpeculationFeaturesInformation — the reporter
+  8. ntoskrnl remap — the non-linear bit shuffle
+  9. Per-output-bit field descriptions (what vbs-info.exe prints)
+ 10. VTL0 KiSpeculationFeatures cross-reference
+ 11. MSR summary
+
+
+================================================================================
+1. OVERVIEW: WHAT CLASS 0xD5 REPORTS
+================================================================================
+
+NtQuerySystemInformation class 0xD5 returns a single DWORD describing the
+speculation mitigation state inside VTL1 (the Secure Kernel, securekernel.exe).
+This is completely separate from VTL0's own speculation reporting (classes 0xC9,
+0xBF, etc.) and from the VBS/DeviceGuard policy (class 0xA5).
+
+The DWORD encodes:
+  - Whether VTL1 KPTI (kernel page table isolation) is active
+  - Which hardware speculation mitigations the Secure Kernel has enabled
+  - The per-CPU boundary enforcement state (IBPB / IBRS at VTL transitions)
+  - Sentinel always-1 bits used as "query succeeded" indicators
+
+These fields are entirely undocumented by Microsoft. The bit layout as seen by
+user-mode callers does NOT match the internal securekernel bit ordering, because
+ntoskrnl applies a non-linear remap between the VTL1 response and the output.
+
+
+================================================================================
+2. THE QUERY PIPELINE
+================================================================================
+
+User-mode call:
+  NtQuerySystemInformation(0xD5, &outDword, 4, ...)
+
+ntoskrnl dispatch (ExpQuerySystemInformation, case 0xD5):
+  → KeQuerySecureSpeculationInformation
+    → HvlSwitchToVsmVtl1 (VMCALL into VTL1)
+      → IumInvokeSecureService(0x102)
+        → SkeQuerySpeculationFeaturesInformation (securekernel)
+          reads: SkiSpeculationFeatures (global DWORD)
+          reads: gs:0xAB0 (per-CPU byte)
+          reads: SkiKvaShadow, SkiKvaShadowMode, SkiFlushPcid
+          → returns 20-bit result in IUM shared buffer
+    ← ntoskrnl receives raw SK bits
+    → KeQuerySecureSpeculationInformation applies non-linear remap
+      → returns remapped DWORD to user-mode
+
+Key point: SkiUpdateSpeculationControl is a DIFFERENT function. It is the
+actuator that programs MSRs and writes gs:0xAB0. It runs from boot init and
+thread-switch paths, NOT from the 0xD5 query path. The query function
+SkeQuerySpeculationFeaturesInformation only READS the state that
+SkiUpdateSpeculationControl previously computed.
+
+
+================================================================================
+3. SkiSpeculationFeatures — THE MASTER DECISION VARIABLE
+================================================================================
+
+Location: securekernel global DWORD (address 0x1400B0488 in analyzed build)
+Written by: SkiDetectHardwareSpeculationFeatures (called once at boot)
+Read by: SkiUpdateSpeculationControl, SkeQuerySpeculationFeaturesInformation
+
+This mirrors VTL0's KiSpeculationFeatures in concept — both are populated by
+running the same CPUID/MSR detection logic, but independently in each VTL.
+The bit layout is similar but not identical to VTL0.
+
+  Bit   Meaning (confirmed from SkiUpdateSpeculationControl usage)
+  ───   ──────────────────────────────────────────────────────────────
+   0    IBRS supported — hardware has IA32_SPEC_CTRL.IBRS (MSR 0x48 bit 0)
+        Source: CPUID 7.0 EDX bit 26, or CPUID 80000008h EBX (AMD)
+        VTL0 equivalent: KiSpeculationFeatures bit 0
+
+   2    IBPB capable — hardware supports IA32_PRED_CMD (MSR 0x49)
+        Source: CPUID 80000008h EBX bit 12 (AMD), or CPUID 7.0 EDX bit 26
+        VTL0 equivalent: KiSpeculationFeatures bit 2
+
+   4    STIBP (Single Thread Indirect Branch Prediction) present
+        Source: CPUID 80000008h EBX bit 15 (AMD)
+        Used by SkiUpdateSpeculationControl: when set, forces IBRS bit in
+        SPEC_CTRL even if bit 0 is clear (STIBP implies need for indirect
+        branch prediction isolation)
+        VTL0 equivalent: KiSpeculationFeatures bit 6
+
+   5    RDCL_NO / hardware Meltdown immunity
+        Source: MSR 0x10A (IA32_ARCH_CAPABILITIES) bit 0, or AMD family >= 17h
+        Effect: when set, SkiUpdateSpeculationControl skips the RSB-stuffing
+        ret-chain (bit 3 of gs:0xAB0) because the CPU is not vulnerable
+        VTL0 equivalent: related to KiSpeculationFeatures bit 5
+
+   6    Enhanced IBRS (eIBRS / IBRS_ALL) — IBRS is always-on after single set
+        Source: MSR 0x10A bit 1 (IBRS_ALL capability)
+        Effect: when set WITHOUT bit 0 or bit 4, use STIBP (bit 1 in SPEC_CTRL)
+        instead of IBRS bit. eIBRS means the CPU retains indirect branch
+        prediction restrictions across privilege transitions without needing
+        IBRS toggling.
+        VTL0 equivalent: KiSpeculationFeatures bit 9
+
+   7    SSBD (Speculative Store Bypass Disable) needed
+        Source: CPUID 80000008h EBX bit 24 (AMD) or CPUID 7.0 EDX bit 31
+        Effect: SkiUpdateSpeculationControl sets bit 2 in SPEC_CTRL (SSBD)
+        when this is set AND bit 8 is clear
+        VTL0 equivalent: KiSpeculationFeatures bit 7
+
+   8    SSB_NO — hardware immune to Speculative Store Bypass
+        Source: MSR 0x10A bit 5 (SSB_NO)
+        Effect: when set, skip SSBD MSR writes entirely — the CPU doesn't
+        need the mitigation
+        VTL0 equivalent: KiSpeculationFeatures bit 8
+
+   9    IBRS enhanced / always-on qualified (sub-feature of bit 0+6)
+        Source: combined IA32_ARCH_CAPABILITIES checks
+        VTL0 equivalent: KiSpeculationFeatures bit 9
+
+  12    IBPB suppressed / not needed
+        Source: policy decision based on hardware caps
+        Effect: when set, SkiUpdateSpeculationControl does NOT set IBPB-on-
+        entry bit (bit 2) in gs:0xAB0
+        VTL0 equivalent: KiSpeculationFeatures bit 12
+
+  13    BHB ret-chain preferred — use ret-chain instead of BHB software flush
+        when IBPB is available
+        Source: SkiDetectHardwareSpeculationFeatures internal logic
+        Effect: enables RSB-stuffing style BHB clearing (bit 3 in gs:0xAB0)
+        VTL0 equivalent: related to KiSpeculationFeatures bit 13
+
+  14    BHB mitigation available — hardware or software BHB flush capability
+        Source: SkiDetectHardwareSpeculationFeatures + SkiBhbFlushSequence != 0
+        Effect: gates bits 5 and 6 in gs:0xAB0 (BHB software flush)
+        VTL0 equivalent: related to BHI mitigation bits
+
+  15    BHI_DIS_S available in IA32_SPEC_CTRL (bit 10)
+        Source: CPUID or IA32_ARCH_CAPABILITIES
+        Effect: when set WITH bit 14, SkiUpdateSpeculationControl sets bit 10
+        (BHI_DIS_S) in the SPEC_CTRL accumulator instead of using software flush
+        VTL0 equivalent: KiSpeculationFeatures related BHI bits
+
+  16    IBRS-via-MSR qualified (used in sentinel generation path)
+        Checked by SkeQuerySpeculationFeaturesInformation for SK bit 8
+
+  17    IBRS-via-MSR sub-qualified (used with bit 16 for sentinel)
+        Checked by SkeQuerySpeculationFeaturesInformation for SK bit 8
+
+
+================================================================================
+4. gs:0xAB0 — PER-CPU BOUNDARY ENFORCEMENT BYTE
+================================================================================
+
+Location: securekernel per-processor block, offset 0xAB0 from GS segment base
+Size: 1 byte (BYTE), followed by related fields at 0xAB2-0xABA
+Written by: SkiUpdateSpeculationControl (sole writer)
+Read by: every VTL transition stub — interrupt entry, syscall entry, exception
+         entry, VTL exit (SkCallNormalMode), VTL re-entry, NMI entry
+
+PURPOSE:
+  This byte is the per-CPU "what mitigations to apply at each privilege
+  boundary crossing" control register. It determines whether IBPB is issued,
+  whether RSB is stuffed, whether BHB is flushed, and which style of BHB
+  flush to use, at every interrupt/exception/syscall/VTL-transition on this
+  particular processor.
+
+  The byte exists PER-CPU (not per-thread, not global) because speculation
+  state is fundamentally a per-physical-core property. Different cores might
+  have different microcode or different thread-scheduling states. The value
+  is recomputed at boot (SkeInitSystem) and at every cross-process context
+  switch (SkiSelectThread).
+
+  VTL transition stubs are the hottest code in the Secure Kernel — they run
+  on every interrupt, every syscall, every timer tick. Having a single byte
+  to test (rather than branching on multiple globals) is a critical
+  performance optimization. The stubs are hand-written assembly that loads
+  this byte with a single `movzx edx, byte ptr gs:0AB0h` and then tests
+  individual bits.
+
+BIT MAP:
+
+  Bit 0 (0x01) — MASTER ENABLE
+  ─────────────────────────────
+  Gates ALL speculation mitigations in VTL transition stubs. When clear,
+  no IBPB is issued, no RSB stuffing occurs, no BHB flush happens.
+  This is the global "speculation control enabled" flag.
+
+  Set by: SkiUpdateSpeculationControl when any mitigation is needed.
+  Preserved across updates (the `and al, 99h` mask at entry keeps bit 0).
+
+  Consumers: all VTL transition stubs check this bit first:
+    test edx, 1
+    jz  no_mitigations
+
+
+  Bit 1 (0x02) — IBPB ON VTL EXIT (return to user/VTL0)
+  ──────────────────────────────────────────────────────
+  When set, the secure kernel issues IBPB (wrmsr MSR 0x49, eax=1) before
+  returning to VTL0 or user-mode from VTL1.
+
+  Purpose: prevent VTL1 indirect branch predictions from being consumed
+  by VTL0 code (which is less trusted). This is a "downward isolation"
+  barrier — ensuring that VTL1's branch predictor training doesn't leak
+  into VTL0's execution context.
+
+  Set when:
+    - SkiSpeculationFeatures bit 0 set AND SkeCpuVendor == 1 (Intel)
+    - OR complex conditions involving bits 4 + 6 + 2
+
+  Assembly in VTL exit stubs (e.g. SkCallNormalMode):
+    movzx edx, byte ptr gs:0AB0h
+    test  edx, 2
+    jz    skip_ibpb_exit
+    mov   eax, 1
+    xor   edx, edx
+    mov   ecx, 49h        ; IA32_PRED_CMD
+    wrmsr                  ; IBPB
+
+  Exposed via 0xD5: YES — this is SK bit 11, remapped to output bit 12.
+  The label in vbs-info.exe reads:
+    "VTL1 per-CPU gs:0xAB0[1] [12] SK11: boundary enforcement"
+
+
+  Bit 2 (0x04) — IBPB ON VTL ENTRY
+  ─────────────────────────────────
+  When set, the secure kernel issues IBPB upon entry INTO VTL1 — at every
+  interrupt, exception, syscall, and explicit VTL call from VTL0.
+
+  Purpose: prevent VTL0 (less trusted) from training the branch predictor
+  with malicious targets that VTL1 would then speculatively execute. This
+  is the "upward isolation" barrier — the most critical one for VSM security.
+
+  Set when:
+    - SkiSpeculationFeatures bit 12 NOT set (IBPB not suppressed)
+    - OR SkiSpeculationFeatures bit 2 set (in the no-IBRS path)
+
+  Assembly in VTL entry stubs (e.g. KiVinaInterrupt, all interrupt vectors):
+    movzx edx, byte ptr gs:0AB0h
+    test  edx, 4
+    jz    skip_ibpb_entry
+    mov   eax, 1
+    xor   edx, edx
+    mov   ecx, 49h        ; IA32_PRED_CMD
+    wrmsr                  ; IBPB
+
+  Exposed via 0xD5: YES — this is SK bit 12, remapped to output bit 13.
+  The label in vbs-info.exe reads:
+    "VTL1 per-CPU gs:0xAB0[2] [13] SK12: boundary enforcement"
+
+
+  Bit 3 (0x08) — RSB STUFFING ON ENTRY
+  ─────────────────────────────────────
+  When set, VTL entry stubs execute a 16-deep CALL/RET gadget to overwrite
+  the Return Stack Buffer (RSB) with known-safe return addresses.
+
+  Purpose: RSB poisoning attack mitigation. An attacker in VTL0 could fill
+  the RSB with malicious return addresses. When VTL1 executes RET
+  instructions, the CPU would speculatively jump to those addresses before
+  the real return target is resolved. RSB stuffing overwrites all RSB
+  entries with safe targets.
+
+  Why 16 deep: Intel and AMD CPUs have RSB depths of 16-32 entries. A
+  16-deep call chain (each CALL pushes a return address) fills the most
+  critical entries.
+
+  Set when:
+    - gs:0xAB0 bit 5 is clear (not using software BHB flush instead)
+    - AND SkiKvaShadowMode != 1
+    - AND either: (bit 2 set AND SkiSpeculationFeatures bit 13 set)
+                  OR (bit 4 set AND bit 0 clear)
+
+  Cleared when:
+    - SkiSpeculationFeatures bit 5 set (RDCL_NO — hardware Meltdown immune)
+    - OR SkiKvaShadowMode == 1
+
+  NOT directly exposed via 0xD5.
+
+
+  Bit 4 (0x10) — PRESERVED (not modified by SkiUpdateSpeculationControl)
+  ──────────────────────────────────────────────────────────────────────
+  The `and al, 99h` mask preserves this bit. Its function is set by other
+  code paths. Likely reserved or used by a different subsystem.
+
+  NOT exposed via 0xD5.
+
+
+  Bit 5 (0x20) — BHB SOFTWARE FLUSH ON VTL ENTRY
+  ───────────────────────────────────────────────
+  When set, VTL entry stubs call SkiFlushBhb to execute a software sequence
+  that clears the Branch History Buffer.
+
+  Purpose: BHI (Branch History Injection) mitigation. The BHB records the
+  history of taken/not-taken branches. An attacker in VTL0 can train the BHB
+  with a specific pattern that causes the indirect branch predictor in VTL1
+  to mispredict to attacker-controlled targets. Flushing the BHB removes
+  this training.
+
+  The flush sequence type is stored at gs:0xABA (SkiBhbFlushSequence).
+
+  Set when:
+    - SkiSpeculationFeatures bit 14 set (BHB mitigation available)
+    - AND bit 15 NOT set (BHI_DIS_S not available — can't use hardware)
+    - AND SkiBhbFlushSequence != 0 (flush sequence is known)
+
+  NOT directly exposed via 0xD5.
+
+
+  Bit 6 (0x40) — BHB SOFTWARE FLUSH ON VTL EXIT
+  ──────────────────────────────────────────────
+  When set, VTL exit stubs (SkCallNormalMode, SkeExitThreadWithReturn) call
+  SkiFlushBhb BEFORE returning to VTL0.
+
+  Purpose: "enhanced" BHB flush — clears BHB in both directions (entry AND
+  exit). This prevents VTL1's BHB training from leaking into VTL0, which
+  could be relevant if VTL0 hosts other sensitive contexts. This is the
+  "belt and suspenders" approach when BHI_DIS_S is available in hardware
+  (bit 10 of SPEC_CTRL) but the kernel also wants software-level assurance.
+
+  Set when:
+    - SkiSpeculationFeatures bit 14 set (BHB mitigation available)
+    - AND bit 15 set (BHI_DIS_S available — hardware handles entry side)
+    - AND SkiBhbFlushSequence != 0
+
+  When both bit 5 and bit 6 would be applicable, bit 15 of SF decides:
+    bit 15 clear → bit 5 only (software flush on entry, no hardware BHI_DIS_S)
+    bit 15 set   → bit 6 only (software flush on exit, hardware handles entry)
+
+  NOT directly exposed via 0xD5.
+
+
+  Bit 7 (0x80) — PRESERVED (not modified by SkiUpdateSpeculationControl)
+  ──────────────────────────────────────────────────────────────────────
+  Same as bit 4 — preserved by the initial mask, not touched by the update
+  function. Reserved or set by other code paths.
+
+  NOT exposed via 0xD5.
+
+
+================================================================================
+5. gs:0xAB2..0xABA — PER-CPU SPEC_CTRL CACHE
+================================================================================
+
+Adjacent to the gs:0xAB0 byte, the per-CPU structure contains cached MSR
+values for IA32_SPEC_CTRL (MSR 0x48). These avoid redundant WRMSR instructions
+(which are expensive serializing operations on most CPUs).
+
+  Offset    Size    Field                     Purpose
+  ──────    ────    ─────                     ───────
+  0xAB0     BYTE    Boundary enforcement      See Section 4 above
+  0xAB2     WORD    KernelSpecCtrl            SPEC_CTRL value for VTL1 kernel entry
+  0xAB4     WORD    NmiSpecCtrl               SPEC_CTRL value for NMI handling
+  0xAB6     WORD    UserSpecCtrl              SPEC_CTRL value for return to user/VTL0/idle
+  0xAB8     WORD    LastWrittenSpecCtrl       Cache of last WRMSR value (avoid redundant writes)
+  0xABA     BYTE    BhbFlushSequence          BHB flush type (from SkiBhbFlushSequence global)
+
+DATA FLOW:
+  1. SkiDetectHardwareSpeculationFeatures runs at boot → populates globals:
+     SkiSpeculationFeatures, SkiSsbdMsr, SkiBhbFlushSequence, SkeCpuVendor
+  2. SkiUpdateSpeculationControl reads globals → computes per-CPU values:
+     - Accumulates r9 (kernel SPEC_CTRL) and r10 (exit SPEC_CTRL) from SF bits
+     - Stores r9 → gs:0xAB2, gs:0xAB4
+     - Stores r10 → gs:0xAB6
+     - Writes MSR 0x48 with r9 if different from gs:0xAB8
+     - Updates gs:0xAB8 cache after write
+     - Copies SkiBhbFlushSequence → gs:0xABA
+  3. VTL transition stubs load from these offsets at runtime
+
+SPEC_CTRL ACCUMULATION LOGIC (how r9/r10 are built):
+
+  SPEC_CTRL Bit    Meaning          Set in r9 when              Set in r10 when
+  ─────────────    ───────          ──────────                  ───────────────
+  0 (IBRS)         IBRS enable      SF[0] set, OR SF[4] set     Same
+  1 (STIBP)        STIBP enable     SF[6] set without SF[0]     Same
+                                    or SF[4] (eIBRS path)
+  2 (SSBD)         SSB Disable      SF[7] set AND SF[8] clear   Same
+                                    AND SkiSsbdMsr == 0x48
+  10 (BHI_DIS_S)   BHI disable      SF[14] AND SF[15] both set  Same
+
+Note: when SkiSsbdMsr != 0x48, SSBD uses a separate MSR (e.g. AMD's
+MSR 0xC001011F / MSR_VIRT_SPEC_CTRL). In that case, SkiUpdateSpeculationControl
+does a read-modify-write of that MSR instead of setting bit 2 in SPEC_CTRL.
+
+
+================================================================================
+6. SkiUpdateSpeculationControl — THE SOLE ACTUATOR
+================================================================================
+
+Address: 0x14008F1FC (securekernel.exe)
+Length: ~185 instructions (lines 207754-207939 in disassembly)
+
+PURPOSE:
+  This is the ONLY function that writes speculation-related MSRs and the
+  gs:0xAB0 control byte in the Secure Kernel. It translates the global
+  hardware capability bits (SkiSpeculationFeatures) into per-CPU runtime
+  configuration.
+
+CALL SITES (exactly two):
+
+  1. SkeInitSystem+0x12C (boot path)
+     Called once per CPU during initialization, after:
+       SkiSetProcessorSignatureAndFlags
+       SkiDetectHardwareSpeculationFeatures ← populates globals
+       SkiEnableKvaShadowing
+     → SkiUpdateSpeculationControl           ← programs MSRs
+       SkiInitializeSystemTsc
+
+  2. SkiSelectThread+0x2A7 (thread switch path)
+     Called during context switch when the new thread belongs to a
+     DIFFERENT PROCESS than the current one:
+       if (newThread->Process != currentProcessor->CurrentProcess
+           && !(newThread->Flags & 0x40))    // not exempt
+         SkiUpdateSpeculationControl();
+         SkeSelectProcessAddressSpace();     // switch address space
+
+     The thread flag bit 6 (0x40) acts as an "exempt from speculation
+     reprovisioning" flag — possibly for IUM trustlets that share the
+     same speculation profile.
+
+  NOT called from:
+    - VTL entry/exit stubs (they CONSUME the pre-computed values)
+    - Interrupt handlers (they read gs:0xAB0, they don't recompute it)
+    - The 0xD5 query path (SkeQuerySpeculationFeaturesInformation only reads)
+
+OPERATION SEQUENCE:
+  1. Mask gs:0xAB0 with 0x99 — preserves bits 0, 3, 4, 7; clears 1, 2, 5, 6
+  2. Read SkiSpeculationFeatures
+  3. Check vendor (SkeCpuVendor) for Intel-specific paths
+  4. Conditionally set gs:0xAB0 bits 1, 2, 3, 5, 6 based on SF bits
+  5. Accumulate r9 (kernel SPEC_CTRL) from IBRS/STIBP/SSBD/BHI_DIS_S
+  6. Store r9 → gs:0xAB2, gs:0xAB4; r10 → gs:0xAB6
+  7. If r9 != gs:0xAB8: WRMSR 0x48 with r9, update cache
+  8. If SkiSsbdMsr != 0x48 and SSBD needed: RDMSR/WRMSR on SkiSsbdMsr
+  9. Copy SkiBhbFlushSequence → gs:0xABA
+
+MSRs WRITTEN:
+  - MSR 0x48 (IA32_SPEC_CTRL): main SPEC_CTRL write, only if value changed
+  - SkiSsbdMsr (variable, e.g. 0xC001011F on AMD): SSBD on separate MSR path
+
+
+================================================================================
+7. SkeQuerySpeculationFeaturesInformation — THE REPORTER
+================================================================================
+
+Address: 0x14008EA18 (securekernel.exe)
+IUM Service: 0x102 (invoked via HvlSwitchToVsmVtl1 → IumInvokeSecureService)
+
+PURPOSE:
+  Reads the current speculation state and packs it into a bitmask for
+  reporting to VTL0 (ntoskrnl). This is the SK-side handler for class 0xD5.
+
+  It reads TWO data sources:
+    A. SkiSpeculationFeatures (global) — what hardware capabilities exist
+    B. gs:0xAB0 (per-CPU) — what mitigations are currently active
+
+  And produces a ~20-bit result by testing individual SF bits and AB0 bits,
+  ORing them into an output structure at [r8+8].
+
+KEY CODE PATH (lines 207422-207546):
+  - Bits 0-7: KPTI and sentinel checks (SkiKvaShadow, SkiKvaShadowMode)
+  - Bit 8: (!SF[16] && !SF[17]) — both IBRS-via-MSR bits clear
+  - Bits 9-10: SF[4] (STIBP), SF[0] (IBRS)
+  - Bits 11-12: gs:0xAB0 shifted left by 10, extracting bits 1 and 2
+  - Bits 13-15: SF[6] (eIBRS), SF[7] (SSBD), !SF[8] (SSB_NO inverted)
+  - Bit 16: hardcoded sentinel via `or ecx, 200h`
+  - Bit 17: hardcoded sentinel via `or edx, 20000h`
+  - Bits 18-19: SF[9]||SF[13], SF[12]
+
+RELATIONSHIP TO SkiUpdateSpeculationControl:
+  These two functions are the read and write sides of the same data:
+    SkiDetectHardwareSpeculationFeatures → SkiSpeculationFeatures (global)
+    SkiUpdateSpeculationControl          → gs:0xAB0, gs:0xAB2-0xABA, MSR 0x48
+    SkeQuerySpeculationFeaturesInformation ← reads both, reports to VTL0
+
+  A caller querying 0xD5 sees BOTH what mitigations are AVAILABLE (from SF)
+  and what mitigations are CURRENTLY ACTIVE on this processor (from gs:0xAB0).
+
+
+================================================================================
+8. ntoskrnl REMAP — THE NON-LINEAR BIT SHUFFLE
+================================================================================
+
+After ntoskrnl receives the raw SK bits from the VTL1 call, it applies a
+non-linear remap in KeQuerySecureSpeculationInformation. The SK bit order
+does NOT match the output bit order. This is 16 remap pairs with 18 total
+bit operations (2 pairs include complementary clear operations for mutual
+exclusion).
+
+  SK Bit    Output Bit    Notes
+  ──────    ──────────    ─────
+  SK  0  →  output  0    (sentinel, always 1)
+  SK  1  →  output  1    (KPTI active)
+  SK  2  →  output  2    (KPTI no-PCID; clears output 3)
+  SK  3  →  output  3    (KPTI + PCID; clears output 2)
+  SK  4  →  (dropped)    ntoskrnl does not map this to any output bit
+  SK 5-7 →  (unused)     SkeQuerySpeculationFeaturesInformation never sets these
+  SK  8  →  output  6
+  SK  9  →  output  7
+  SK 10  →  output  8
+  SK 11  →  output 12    (gs:0xAB0 bit 1 — IBPB exit)
+  SK 12  →  output 13    (gs:0xAB0 bit 2 — IBPB entry)
+  SK 13  →  output  9
+  SK 14  →  output 10
+  SK 15  →  output 11
+  SK 16  →  output  5    (sentinel, always 1)
+  SK 17  →  output  4    (sentinel, always 1)
+  SK 18  →  output 14
+  SK 19  →  output 15
+
+
+================================================================================
+9. PER-OUTPUT-BIT FIELD DESCRIPTIONS
+================================================================================
+
+These are the bits as seen by user-mode callers of NtQuerySystemInformation(0xD5)
+and as printed by vbs-info.exe. Output bit numbers match the code's PrintBit calls.
+
+─── Output Bit 0 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 sentinel always-1 [0] SK0: hardcoded"
+  SK source: bit 0, hardcoded to 1 by SkeQuerySpeculationFeaturesInformation
+
+  This is a sentinel bit — it is ALWAYS set when the VTL1 query succeeds.
+  If this bit is 0, the query either failed or VTL1 is not present.
+
+  Why it exists: provides a simple "VSM is active and responding" indicator.
+  Before VSM existed, class 0xD5 would return all-zeros (STATUS_INVALID_INFO_CLASS
+  or empty buffer). A caller can check bit 0 to distinguish "VSM present,
+  no mitigations" from "VSM not present."
+
+
+─── Output Bit 1 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 KPTI active [1] SK1: SkiKvaShadow != 0"
+  SK source: bit 1, set when SkiKvaShadow global is non-zero
+
+  Indicates whether VTL1 has Kernel Page Table Isolation (KPTI / KVA Shadow)
+  enabled. KPTI was introduced for Meltdown (CVE-2017-5754) mitigation.
+
+  When active, the Secure Kernel maintains separate page tables for user-mode
+  and kernel-mode, switching between them at every syscall/interrupt entry/exit.
+  This prevents Meltdown-style attacks where user-mode code speculatively reads
+  kernel memory.
+
+  VTL1 has its OWN KPTI implementation separate from VTL0's. Even if VTL0
+  disables KPTI (e.g. on AMD CPUs with RDCL_NO), VTL1 may still enable it
+  as defense-in-depth.
+
+
+─── Output Bit 2 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 KPTI no-PCID [2] SK2: SkiKvaShadowMode == 2"
+  SK source: bit 2, set when SkiKvaShadowMode == 2
+
+  VTL1 KPTI is active WITHOUT Process Context Identifiers (PCID). In mode 2,
+  every kernel↔user transition requires a full TLB flush (CR3 write without
+  PCID). This is the slow path — significantly more expensive than mode 1.
+
+  Mutually exclusive with output bit 3 (the remap includes complementary clears).
+
+  PCID-less KPTI is used when:
+    - The CPU doesn't support PCID (CPUID.01H:ECX bit 17)
+    - PCID was disabled by policy
+    - INVPCID instruction is not available
+
+
+─── Output Bit 3 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 KPTI + PCID [3] SK3: SkiKvaShadowMode == 1"
+  SK source: bit 3, set when SkiKvaShadowMode == 1
+
+  VTL1 KPTI is active WITH PCID support. This is the fast path — the CPU
+  can maintain separate TLB entries tagged by PCID, so a kernel↔user switch
+  only flushes the relevant entries instead of the entire TLB.
+
+  Mutually exclusive with output bit 2.
+
+  Mode 1 (PCID) is the preferred mode on modern CPUs. Intel CPUs since
+  Haswell (2013) and recent AMD CPUs support PCID.
+
+
+─── Output Bit 4 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 sentinel always-1 [4] SK17: or edx,20000h"
+  SK source: bit 17, hardcoded via `or edx, 20000h` in SkeQuerySpeculationFeaturesInformation
+
+  Second sentinel bit, always set. Like bit 0, this confirms the query reached
+  securekernel and returned successfully.
+
+  The specific instruction `or edx, 20000h` sets bit 17 (0x20000) of the SK
+  output register unconditionally. After ntoskrnl remap, it appears as bit 4.
+
+
+─── Output Bit 5 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 sentinel always-1 [5] SK16: or ecx,200h + shl 7"
+  SK source: bit 16, hardcoded via `or ecx, 200h` followed by `shl ecx, 7`
+
+  Third sentinel bit, always set. The odd instruction sequence
+  (`or ecx, 200h` = set bit 9, then `shl ecx, 7` = shift to bit 16)
+  is a compiler artifact — the result is the same as `or ecx, 10000h`.
+
+  Three sentinel bits (0, 4, 5) may seem redundant, but they serve as
+  a simple integrity check: if all three are set, the query pipeline
+  (user → ntoskrnl → hypervisor → securekernel → remap → user) completed
+  without corruption.
+
+
+─── Output Bit 6 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 !SF[16]&&!SF[17] [6] SK8: SkiSpeculationFeatures"
+  SK source: bit 8, set when SkiSpeculationFeatures bits 16 AND 17 are BOTH clear
+
+  Reports that VTL1 does NOT have "IBRS via MSR" capability. Bits 16 and 17
+  of SkiSpeculationFeatures represent two tiers of IBRS-via-MSR qualification.
+  When both are clear, this output bit is set.
+
+  This is effectively a "fallback IBRS" indicator: the hardware either doesn't
+  support enhanced IBRS or the platform (hypervisor/policy) hasn't enabled it.
+  When set, VTL1 uses classic IBRS (toggle on entry/exit) rather than
+  always-on enhanced IBRS.
+
+  VTL0 equivalent: related to KiSpeculationFeatures bits 16-17 (IBRS-via-MSR
+  qualified/sub-qualified).
+
+
+─── Output Bit 7 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 SF[4] [7] SK9: SkiSpeculationFeatures"
+  SK source: bit 9, set from SkiSpeculationFeatures bit 4
+
+  Reports that VTL1 detected STIBP (Single Thread Indirect Branch Prediction)
+  hardware support.
+
+  STIBP prevents sibling hyperthreads from influencing each other's indirect
+  branch predictions. This matters for VTL1 because a malicious thread on a
+  sibling hyperthread in VTL0 could train the predictor with targets that
+  VTL1 code would speculatively execute.
+
+  VTL0 equivalent: KiSpeculationFeatures bit 6 (STIBP present), sourced from
+  CPUID 80000008h EBX bit 15 (AMD) or CPUID 7.0 EDX bit 27 (Intel).
+
+
+─── Output Bit 8 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 SF[0] [8] SK10: SkiSpeculationFeatures"
+  SK source: bit 10, set from SkiSpeculationFeatures bit 0
+
+  Reports that VTL1 detected IBRS (Indirect Branch Restricted Speculation)
+  hardware support.
+
+  IBRS restricts indirect branch predictions so that code running at a higher
+  privilege level cannot be influenced by predictions trained at a lower
+  privilege level. For VTL1, this is the primary Spectre v2 mitigation for
+  code running in the Secure Kernel.
+
+  When IBRS is set in IA32_SPEC_CTRL (MSR 0x48 bit 0), the CPU guarantees
+  that indirect branches in VTL1 will not use predictions trained by VTL0.
+
+  VTL0 equivalent: KiSpeculationFeatures bit 0, sourced from CPUID 7.0 EDX
+  bit 26 (IBRS/IBPB support) and MSR 0x10A (IA32_ARCH_CAPABILITIES).
+
+
+─── Output Bit 9 ────────────────────────────────────────────────────────────────
+  Label:  "VTL1 SF[6] [9] SK13: SkiSpeculationFeatures"
+  SK source: bit 13, set from SkiSpeculationFeatures bit 6
+
+  Reports that VTL1 detected Enhanced IBRS (eIBRS / IBRS_ALL) support.
+
+  eIBRS is a significant improvement over classic IBRS: once IBRS is set in
+  SPEC_CTRL, the CPU RETAINS indirect branch prediction isolation across ALL
+  privilege transitions without needing to toggle the bit. This means:
+    - No WRMSR at every interrupt/syscall entry (huge performance win)
+    - Prediction isolation is "always on" after initial setup
+    - The CPU handles the isolation transparently in hardware
+
+  When eIBRS is available, SkiUpdateSpeculationControl may use STIBP
+  (SPEC_CTRL bit 1) instead of classic IBRS toggling, because eIBRS
+  already handles cross-privilege isolation.
+
+  VTL0 equivalent: KiSpeculationFeatures bit 9, sourced from MSR 0x10A
+  (IA32_ARCH_CAPABILITIES) bit 1 (IBRS_ALL).
+
+
+─── Output Bit 10 ───────────────────────────────────────────────────────────────
+  Label:  "VTL1 SF[7] [10] SK14: SkiSpeculationFeatures"
+  SK source: bit 14, set from SkiSpeculationFeatures bit 7
+
+  Reports that VTL1 detected SSBD (Speculative Store Bypass Disable)
+  capability.
+
+  Speculative Store Bypass (SSB / Spectre v4) is a vulnerability where the
+  CPU speculatively loads a value from a store buffer before verifying that
+  a later store to the same address hasn't occurred. An attacker can exploit
+  this to read stale values speculatively.
+
+  SSBD sets bit 2 in IA32_SPEC_CTRL to disable this speculative optimization.
+  This has a performance cost (store-to-load forwarding becomes strictly ordered)
+  but prevents the attack.
+
+  VTL0 equivalent: KiSpeculationFeatures bit 7, sourced from CPUID 80000008h
+  EBX bit 24 (AMD) or CPUID 7.0 EDX bit 31 (Intel).
+
+
+─── Output Bit 11 ───────────────────────────────────────────────────────────────
+  Label:  "VTL1 NOT SF[8] [11] SK15: !SkiSpeculationFeatures[8]"
+  SK source: bit 15, set from the INVERSE of SkiSpeculationFeatures bit 8
+
+  Reports that VTL1 does NOT have SSB_NO (i.e., the CPU IS vulnerable to
+  Speculative Store Bypass and needs SSBD mitigation).
+
+  This is an inverted bit: it is SET when the CPU needs SSBD, and CLEAR when
+  the CPU is immune (SSB_NO).
+
+  SSB_NO (MSR 0x10A bit 5) means the CPU is architecturally immune to
+  Speculative Store Bypass — no mitigation is needed, and SSBD writes are
+  unnecessary. Modern CPUs (AMD Zen 3+, some Intel) have SSB_NO.
+
+  Inverted reporting: the query reports "NOT immune" rather than "immune"
+  because the consumer typically wants to know "do I need SSBD?" — a set
+  bit means "yes, SSBD is needed."
+
+
+─── Output Bit 12 ───────────────────────────────────────────────────────────────
+  Label:  "VTL1 per-CPU gs:0xAB0[1] [12] SK11: boundary enforcement"
+  SK source: bit 11, set from gs:0xAB0 bit 1 (shifted left by 10)
+
+  Reports the CURRENT runtime state of IBPB-on-exit for this CPU.
+
+  This is a per-CPU, runtime field — unlike the SF-sourced bits which report
+  global hardware capabilities, this bit reflects what THIS specific processor
+  is currently doing at VTL transitions.
+
+  When set: this CPU issues IBPB (MSR 0x49 write) every time it exits VTL1
+  back to VTL0 or user-mode. This flushes all indirect branch predictions
+  to prevent VTL1 branch training from leaking to less-trusted contexts.
+
+  See Section 4 (gs:0xAB0 bit 1) for full details on who sets this and why.
+
+
+─── Output Bit 13 ───────────────────────────────────────────────────────────────
+  Label:  "VTL1 per-CPU gs:0xAB0[2] [13] SK12: boundary enforcement"
+  SK source: bit 12, set from gs:0xAB0 bit 2 (shifted left by 10)
+
+  Reports the CURRENT runtime state of IBPB-on-entry for this CPU.
+
+  When set: this CPU issues IBPB every time it enters VTL1 from VTL0 — at
+  every interrupt, exception, syscall, and explicit VTL call. This is the
+  primary "upward isolation" barrier preventing VTL0 branch predictor
+  poisoning from affecting VTL1.
+
+  This is arguably the most security-critical bit in the entire 0xD5 output:
+  if a CPU reports bit 13 = 0, it means VTL0's branch predictor training
+  survives into VTL1 execution — a potential Spectre v2 attack surface.
+
+  See Section 4 (gs:0xAB0 bit 2) for full details.
+
+
+─── Output Bit 14 ───────────────────────────────────────────────────────────────
+  Label:  "VTL1 SF[9]||SF[13] [14] SK18: SkiSpeculationFeatures"
+  SK source: bit 18, set from SkiSpeculationFeatures bit 9 OR bit 13
+
+  Reports that VTL1 has either enhanced IBRS always-on (bit 9) OR
+  BHB ret-chain preference (bit 13) active.
+
+  This is a combined "advanced IBRS/BHB capability" indicator:
+    - SF[9]: IBRS enhanced / always-on — the CPU supports set-once IBRS
+    - SF[13]: BHB ret-chain — hardware/policy prefers RSB-stuffing style
+              BHB clearing instead of software sequence
+
+  When either is set, VTL1 has some form of advanced indirect branch
+  prediction mitigation beyond basic IBRS toggling.
+
+
+─── Output Bit 15 ───────────────────────────────────────────────────────────────
+  Label:  "VTL1 SF[12] [15] SK19: SkiSpeculationFeatures"
+  SK source: bit 19, set from SkiSpeculationFeatures bit 12
+
+  Reports that VTL1 has IBPB suppressed (not needed).
+
+  When this bit is set, the secure kernel has determined that IBPB is
+  unnecessary for this platform — the hardware provides sufficient isolation
+  through other means (e.g. enhanced IBRS, hardware-level VTL isolation
+  in the hypervisor, or CPU microcode that handles prediction partitioning).
+
+  This is a "relaxation" bit: when set, it means the platform is secure
+  enough that IBPB overhead can be avoided. When clear, IBPB is still
+  considered necessary.
+
+  Note: even when IBPB is "suppressed" at the global level, the per-CPU
+  bits 12-13 reflect the actual runtime state — if IBPB is suppressed,
+  you'd expect bits 12 and 13 to both be 0.
+
+
+================================================================================
+10. VTL0 KiSpeculationFeatures CROSS-REFERENCE
+================================================================================
+
+VTL0 (ntoskrnl) has its own KiSpeculationFeatures variable at 0x140FC5B48.
+It is a 128-bit value (xmmword), with the low 64 bits holding the primary
+feature flags. Both VTL0 and VTL1 run the same CPUID/MSR detection logic on
+the same hardware, so many bits correspond directly:
+
+  VTL1 SkiSpeculationFeatures    VTL0 KiSpeculationFeatures    CPUID/MSR Source
+  ──────────────────────────     ──────────────────────────     ────────────────
+  Bit  0 (IBRS)                  Bit  0 (IBRS capable)          MSR 0x10A bit 1 / CPUID 7.0 EDX.26
+  Bit  2 (IBPB)                  Bit  2 (IBPB capable)          CPUID 80000008h EBX.12
+  Bit  4 (STIBP)                 Bit  6 (STIBP present)         CPUID 80000008h EBX.15
+  Bit  5 (RDCL_NO)              Bit  5 (KVA shadow/SSBD)       MSR 0x10A bit 0 / AMD family >= 17h
+  Bit  6 (eIBRS)                 Bit  9 (eIBRS / IBRS_ALL)      MSR 0x10A bit 1
+  Bit  7 (SSBD needed)          Bit  7 (SSBD present)           CPUID 80000008h EBX.24 / 7.0 EDX.31
+  Bit  8 (SSB_NO)               Bit  8 (SSBD via SPEC_CTRL)     MSR 0x10A bit 5
+  Bit  9 (IBRS enhanced)        Bit  9 (combined w/ bit 0)      MSR 0x10A
+  Bit 12 (IBPB suppressed)      Bit 12 (BPB isolation enabled) Combined IBPB + IBRS present
+  Bit 16 (IBRS-via-MSR)         Bit 16 (IBRS via MSR present)  KeFeatureBits2 bit 26 / HV
+  Bit 17 (IBRS-via-MSR sub)     Bit 17 (IBRS via MSR qual.)    MSR 0x123 / KeFeatureBits2 bit 31
+
+  Note: bit numbers are NOT identical between VTL0 and VTL1. The same hardware
+  feature may be at different bit positions. The table above shows semantic
+  equivalence based on CPUID/MSR source matching.
+
+
+================================================================================
+11. MSR SUMMARY
+================================================================================
+
+  MSR 0x48 — IA32_SPEC_CTRL (Speculation Control)
+  ────────────────────────────────────────────────
+  Read/Write. The primary speculation control register.
+    Bit 0: IBRS — Indirect Branch Restricted Speculation
+    Bit 1: STIBP — Single Thread Indirect Branch Prediction
+    Bit 2: SSBD — Speculative Store Bypass Disable
+    Bit 10: BHI_DIS_S — Branch History Injection Disable (Supervisor)
+  Written by SkiUpdateSpeculationControl at boot and context switch.
+  Cached at gs:0xAB8 to avoid redundant writes.
+
+  MSR 0x49 — IA32_PRED_CMD (Prediction Command)
+  ──────────────────────────────────────────────
+  Write-only. Issues branch prediction barriers.
+    Bit 0: IBPB — Indirect Branch Prediction Barrier
+  Writing 1 to bit 0 invalidates all indirect branch predictions.
+  Written by VTL transition stubs when gs:0xAB0 bits 1/2 are set.
+  NOT written by SkiUpdateSpeculationControl itself — only the stubs.
+
+  MSR 0x10A — IA32_ARCH_CAPABILITIES
+  ──────────────────────────────────
+  Read-only. Reports CPU architectural vulnerability mitigations.
+    Bit 0: RDCL_NO — not vulnerable to Meltdown
+    Bit 1: IBRS_ALL — IBRS is always-on (enhanced IBRS / eIBRS)
+    Bit 4: SSB_NO — not vulnerable to Speculative Store Bypass
+    Bit 5: MDS_NO — not vulnerable to Microarchitectural Data Sampling
+  Read by SkiDetectHardwareSpeculationFeatures to populate SkiSpeculationFeatures.
+
+  MSR 0xC001011F — MSR_VIRT_SPEC_CTRL (AMD)
+  ──────────────────────────────────────────
+  AMD-specific virtual speculation control. Used when SkiSsbdMsr != 0x48
+  for SSBD on AMD platforms that don't route SSBD through IA32_SPEC_CTRL.
+  SkiUpdateSpeculationControl does read-modify-write on this MSR.
+
+
+================================================================================
+  END OF DOCUMENT
+================================================================================
